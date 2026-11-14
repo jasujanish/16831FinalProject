@@ -130,7 +130,9 @@ def compute_td_surprise(
         next_actions, info = actor(observations=batch["actor_next_observation"], training=False)
         # Clone variables to prevent overwriting
         next_actions = next_actions.clone()
-        next_actor_entropy = temperature() * info["log_prob"].clone()
+
+        next_log_probs = info["log_prob"].clone()
+        next_actor_entropy = temperature() * next_log_probs
 
         next_qs, next_q_infos = target_critic(
             observations=batch["next_observation"],
