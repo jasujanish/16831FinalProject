@@ -15,10 +15,11 @@ All keys live in `configs/agent/flashSAC.yaml` and are set with `--overrides age
 | `actor_delay` | `fixed`, `ema` | Actor delay rule |
 | `actor_update_period` | `2` | Delay `d` for `actor_delay=fixed` |
 | `actor_delay_ema_interval` | `100` | `k`: critic updates between delay recomputations |
-| `actor_delay_ema_beta` | `0.9` | EMA decay, applied once per interval |
+| `actor_delay_ema_beta` | `0.9` | EMA decay, applied once per interval |w
 | `actor_delay_ema_scale` | `2.0` | Delay when the TD error equals its EMA |
 | `actor_delay_ema_min` / `_max` | `1.0` / `8.0` | Clip range of the delay |
 | `actor_lr_schedule` | `actor_step`, `global_step` | What drives the actor/temperature learning-rate schedule |
+| `critic_target` | `target`, `online`, `minto`, `minto_net` | Which networks the TD target is built from |
 
 `log_csv` (default `true`, in `configs/flashSAC_base.yaml`) turns the CSV log on or off.
 
@@ -52,6 +53,22 @@ The delay is real-valued: each critic update earns `1/delay` credit and an actor
 schedule depends on the delay. `actor_lr_schedule=global_step` ties it to the number of critic updates instead. Use it
 for all runs of a delay comparison (it also changes the `d=2` baseline).
 
+**Critic targets** (`_select_target_log_probs` in `flash_rl/agents/flashSAC/update.py`). Every option keeps the
+next-state return distribution with the lowest Q (the mean of the distribution) among its candidates, then builds the
+categorical TD target from it as before. The online candidates are the next-state half of the critic's own joint
+`[s, s']` forward pass, gradient stopped, so they cost no extra forward pass.
+
+| Option | Candidates | Notes |
+|---|---|---|
+| `target` | the 2 target critics | FlashSAC (clipped double Q) |
+| `online` | the 2 online critics | CrossQ-style: no target network. The target critic is neither called nor Polyak-updated; checkpoints save the current critic as `target_critic.pt` |
+| `minto` | the 2 target + the 2 online critics | MINTO ([Hendawy et al.](https://arxiv.org/abs/2510.02590)); never above `target` |
+| `minto_net` | mean of the 2 target critics vs. mean of the 2 online critics | MINTO without clipped double Q: all pessimism comes from the online-vs-target minimum |
+
+The actor objective is unchanged (`min` of the 2 online critics). LaBER scoring always uses the target network, so
+`sampler=laber` requires `critic_target=target`. The online pass now runs before the target pass, which does not change
+the `target` results (the two networks share no state).
+
 ## Running
 
     scripts/run_humanoid.sh <exp_name> [agent overrides...]
@@ -83,6 +100,8 @@ Each run writes `logs/<group_name>/<exp_name>/<env_name>/seed<seed>_<time>/`:
 | `replay/batch_td_abs`, `replay/batch_surprise` | Unweighted error of the critic's batch |
 | `replay/age_surprise_corr` | Pearson correlation between age and surprise in the critic's batch |
 | `replay/size` | Transitions in the buffer |
+| `critic_target/gap` | Mean \|Q_target − Q_online\| at (s', a') over both critics: how stale the target network is. Not logged for `online` |
+| `critic_target/online_frac` | Fraction of the batch whose TD target came from an online critic (`minto`, `minto_net`) |
 | `actor_delay/delay`, `td_ratio`, `td_ema` | Current delay, `e / ema`, and the EMA |
 | `actor_delay/actor_updated` | Fraction of critic updates that also updated the actor |
 | `laber/candidate_*` | Surprise, TD error, age and their correlation over the uniform candidates |
@@ -109,4 +128,6 @@ the Isaac Sim viewport as before.
 
     python -m pytest tests/test_extensions.py
 
-CPU-only; covers the SWD sampling distribution, ages, the delay rules, LaBER weights, the LR schedule and the CSV log.
+CPU-only; covers the SWD sampling distribution, ages, the delay rules, LaBER weights, the LR schedule, the critic
+target options and the CSV log. The tests disable `torch.compile`, so run a short GPU job per `critic_target` option
+before a sweep.

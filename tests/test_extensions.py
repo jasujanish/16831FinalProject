@@ -1,5 +1,5 @@
 """
-CPU tests for the project extensions (SWD / LaBER sampling, adaptive actor delay, logging).
+CPU tests for the project extensions (SWD / LaBER sampling, adaptive actor delay, critic targets, logging).
 
     python -m pytest tests/test_extensions.py
 """
@@ -19,6 +19,7 @@ from omegaconf import OmegaConf
 from flash_rl.agents import create_agent
 from flash_rl.agents.flashSAC.actor_delay import ActorDelay
 from flash_rl.agents.flashSAC.layer import EnsembleUnitBatchNorm
+from flash_rl.agents.flashSAC.update import CRITIC_TARGETS, _select_target_log_probs
 from flash_rl.buffers.torch_buffer import TorchUniformBuffer
 from flash_rl.common.logger import CsvTrainerLogger
 
@@ -204,6 +205,90 @@ def test_weighted_batchnorm_recovers_uniform_statistics() -> None:
     # uniform weights reproduce the unweighted layer
     out = norm(batch, training=True)
     assert torch.allclose(norm(batch, training=True, sample_weights=torch.ones(4096)), out, atol=1e-4)
+
+
+def test_select_target_log_probs() -> None:
+    torch.manual_seed(0)
+    num_bins, batch_size = 11, 512
+    bins = torch.linspace(-1, 1, num_bins)
+
+    def random_critics():
+        log_probs = torch.log_softmax(3 * torch.randn(2, batch_size, num_bins), dim=-1)
+        return (log_probs.exp() * bins).sum(-1), log_probs  # Q = mean of the distribution
+
+    online_qs, online_lp = random_critics()
+    target_qs, target_lp = random_critics()
+
+    def q_of(log_probs):
+        return (log_probs.exp() * bins).sum(-1)
+
+    selected = {}
+    for mode in CRITIC_TARGETS:
+        log_probs, online_chosen = _select_target_log_probs(mode, online_qs, online_lp, target_qs, target_lp)
+        assert log_probs.shape == (batch_size, num_bins)
+        assert torch.allclose(log_probs.exp().sum(-1), torch.ones(batch_size), atol=1e-5)
+        assert (online_chosen is not None) == mode.startswith("minto")
+        selected[mode] = q_of(log_probs)
+
+    assert torch.allclose(selected["target"], target_qs.min(0).values, atol=1e-5)
+    assert torch.allclose(selected["online"], online_qs.min(0).values, atol=1e-5)
+    # MINTO: never above the target-network estimate, and lower wherever an online critic is lower
+    assert torch.allclose(selected["minto"], torch.minimum(target_qs.min(0).values, online_qs.min(0).values), atol=1e-5)
+    assert (selected["minto"] <= selected["target"] + 1e-6).all()
+    assert torch.allclose(selected["minto_net"], torch.minimum(target_qs.mean(0), online_qs.mean(0)), atol=1e-5)
+    # online-chosen flags match the comparison
+    _, online_chosen = _select_target_log_probs("minto_net", online_qs, online_lp, target_qs, target_lp)
+    assert torch.equal(online_chosen, online_qs.mean(0) < target_qs.mean(0))
+    # online mode does not need the target network
+    log_probs, _ = _select_target_log_probs("online", online_qs, online_lp, None, None)
+    assert torch.allclose(q_of(log_probs), selected["online"])
+
+
+def test_critic_targets_agree_when_target_equals_online() -> None:
+    # at initialization the target critic is a copy of the critic, so target / online / minto yield the
+    # same update. minto_net does not: it averages the 2 critics instead of taking their minimum.
+    losses = {}
+    for mode in CRITIC_TARGETS:
+        torch.manual_seed(0)
+        agent = make_agent(f"agent.critic_target={mode}")
+        losses[mode] = agent.update()["critic/loss"]
+    for mode in ("online", "minto"):
+        assert losses[mode] == pytest.approx(losses["target"], rel=1e-6), losses
+    assert losses["minto_net"] != pytest.approx(losses["target"], rel=1e-6), losses
+
+
+@pytest.mark.parametrize("critic_target", CRITIC_TARGETS)
+def test_critic_target_update(critic_target: str) -> None:
+    agent = make_agent(f"agent.critic_target={critic_target}")
+    target_before = [p.detach().clone() for p in agent._target_critic.network.parameters()]
+    infos = [agent.update() for _ in range(20)]
+    for info in infos:
+        assert all(np.isfinite(v) for v in info.values()), info
+    info = infos[-1]
+    assert ("critic_target/gap" in info) == (critic_target != "online")
+    assert ("critic_target/online_frac" in info) == critic_target.startswith("minto")
+    if critic_target.startswith("minto"):
+        assert 0.0 <= info["critic_target/online_frac"] <= 1.0
+    # the target network is frozen (and unused) without Polyak updates, and moves otherwise
+    target_after = list(agent._target_critic.network.parameters())
+    unchanged = all(torch.equal(a, b) for a, b in zip(target_before, target_after))
+    assert unchanged == (critic_target == "online")
+
+
+def test_online_checkpoint_saves_current_critic_as_target(tmp_path) -> None:
+    agent = make_agent("agent.critic_target=online")
+    for _ in range(5):
+        agent.update()
+    agent.save(str(tmp_path))
+    saved_critic = torch.load(tmp_path / "critic.pt")["network_state_dict"]
+    saved_target = torch.load(tmp_path / "target_critic.pt")["network_state_dict"]
+    assert saved_critic.keys() == saved_target.keys()
+    assert all(torch.equal(saved_critic[k], saved_target[k]) for k in saved_critic)
+
+
+def test_laber_requires_target_network() -> None:
+    with pytest.raises(AssertionError, match="LaBER"):
+        make_agent("agent.sampler=laber", "agent.critic_target=minto")
 
 
 def test_buffer_save_load(tmp_path) -> None:

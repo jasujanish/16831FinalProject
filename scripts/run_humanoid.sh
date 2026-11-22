@@ -10,6 +10,9 @@
 #   scripts/run_humanoid.sh uniform_d4  agent.actor_update_period=4 agent.actor_lr_schedule=global_step
 #   scripts/run_humanoid.sh uniform_ema agent.actor_delay=ema agent.actor_delay_ema_interval=100 \
 #                                       agent.actor_lr_schedule=global_step
+#   scripts/run_humanoid.sh crossq      agent.critic_target=online
+#   scripts/run_humanoid.sh minto       agent.critic_target=minto
+#   scripts/run_humanoid.sh minto_net   agent.critic_target=minto_net
 #
 # SEEDS and ENVS can be set in the environment, e.g. SEEDS="0 1000" ENVS="Isaac-Velocity-Flat-G1-v0".
 # Metrics are written to logs/humanoid/<exp_name>/<env_name>/seed<seed>_<time>/metrics.csv

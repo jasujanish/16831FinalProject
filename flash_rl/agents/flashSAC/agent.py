@@ -16,6 +16,7 @@ from flash_rl.agents.flashSAC.network import (
     FlashSACTemperature,
 )
 from flash_rl.agents.flashSAC.update import (
+    CRITIC_TARGETS,
     compute_td_surprise,
     pearson_corr,
     update_actor,
@@ -77,6 +78,7 @@ class FlashSACConfig:
     critic_min_v: float
     critic_max_v: float
     critic_target_update_tau: float
+    critic_target: str  # 'target' | 'online' | 'minto' | 'minto_net'
 
     temp_initial_value: float
     temp_target_sigma: float
@@ -330,11 +332,15 @@ def _update_networks(
         device=device,
         use_amp=cfg.use_amp,
         grad_scaler=grad_scaler,
+        critic_target=cfg.critic_target,
     )
 
-    target_critic_info = update_target_network(
-        target_network=target_critic,
-    )
+    # without a target network (CrossQ-style) the target critic is unused and keeps its initial weights
+    target_critic_info: dict[str, torch.Tensor] = {}
+    if cfg.critic_target != "online":
+        target_critic_info = update_target_network(
+            target_network=target_critic,
+        )
 
     # Merge all info dicts
     update_info = {
@@ -398,6 +404,9 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
 
         assert cfg.sampler in ("uniform", "swd", "laber"), f"Unknown sampler: {cfg.sampler}"
         assert cfg.actor_lr_schedule in ("actor_step", "global_step")
+        assert cfg.critic_target in CRITIC_TARGETS, f"Unknown critic target: {cfg.critic_target}"
+        # LaBER's scoring (`compute_td_surprise`) always builds its targets from the target network
+        assert cfg.sampler != "laber" or cfg.critic_target == "target", "LaBER requires critic_target='target'"
         self._update_step = 0
         self._lr_schedule = _make_lr_schedule(cfg)
         self._actor_delay = ActorDelay(
@@ -636,6 +645,9 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
 
     def save(self, path: str) -> None:
         os.makedirs(path, exist_ok=True)
+        if self._cfg.critic_target == "online":
+            # the unused target critic still holds its initial weights; save what `online` bootstraps from instead
+            self._target_critic.network.load_state_dict(self._critic.network.state_dict())
         self._actor.save(os.path.join(path, "actor.pt"))
         self._critic.save(os.path.join(path, "critic.pt"))
         self._target_critic.save(os.path.join(path, "target_critic.pt"))

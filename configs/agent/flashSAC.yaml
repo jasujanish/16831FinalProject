@@ -66,6 +66,12 @@ critic_num_bins: 101
 critic_min_v: ${eval:'-${agent.normalized_G_max}'}
 critic_max_v: ${eval:'${agent.normalized_G_max}'}
 critic_target_update_tau: 0.01
+# Networks the TD target is built from (each option keeps the lowest-Q distribution among its candidates).
+#   target:    FlashSAC default. The 2 target critics (clipped double Q).
+#   online:    CrossQ-style, no target network: the 2 online critics, gradient stopped. No Polyak update.
+#   minto:     MINTO: the 2 target and the 2 online critics.
+#   minto_net: MINTO between networks: the mean of the 2 target critics vs. the mean of the 2 online critics.
+critic_target: 'target'   # ['target', 'online', 'minto', 'minto_net']
 
 temp_initial_value: 0.01
 temp_target_sigma: 0.15
