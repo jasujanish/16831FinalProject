@@ -5,7 +5,9 @@ Reads logs/<group>/<exp>/<env>/seed*/metrics.csv (written by CsvTrainerLogger) a
   - <exp>_eval.csv: evaluation returns in the paper's long format (exp_name, env_name, seed, metric, env_step, value),
     so our curves and the paper curves can go through the same plotting code.
   - <exp>_summary.csv: one row per task (final return, normalized AUC, paper numbers, wall-clock, memory).
+    *_gap_z is (ours - paper) / combined standard error of the two means.
   - <exp>_curves.png: return vs. env steps (ours per seed + mean, paper mean +- SD).
+All env_step values are logging steps, as in the paper CSV, not the exact steps at which the evals ran.
 
 usage: python scripts/compare_baseline.py [--exp uniform_d2] [--group humanoid] [--out_dir results/ours]
 """
@@ -32,9 +34,10 @@ def load_run(path: str) -> dict:
     df = pd.read_csv(path)
     seed = int(os.path.basename(os.path.dirname(path)).split("_")[0].removeprefix("seed"))
     evals = df[df["avg_return"].notna()] if "avg_return" in df else df.iloc[0:0]
-    # the eval step is logged with each eval; the initial eval (step 0) and older logs only have the logging step
-    steps = evals["eval_env_step"].fillna(evals["env_step"]) if "eval_env_step" in evals else evals["env_step"]
-    curve = pd.DataFrame({"env_step": steps.values, "avg_return": evals["avg_return"].values})
+    # The paper CSV records an eval at the next logging step (the 5.00M eval at 5.50M, and so on), so use our logging
+    # step too. `eval_env_step` is when the eval really ran; mixing it with the paper's axis shifts our curves ~0.5M
+    # steps left and inflates our AUC. The last row is the mean of the last two evals (49.99M and 50.00M) in both.
+    curve = evals[["env_step", "avg_return"]]
     curve = curve.drop_duplicates("env_step", keep="last").sort_values("env_step")
     last = df.ffill().iloc[-1]  # last logged value of each column
     return {
@@ -56,8 +59,7 @@ def normalized_auc(steps: np.ndarray, returns: np.ndarray, horizon: float = NUM_
     if len(steps) < 2:
         return np.nan
     trapezoid = getattr(np, "trapezoid", None) or np.trapz  # numpy < 2.0 only has trapz
-    # the last eval can land a few interaction steps before the horizon, so accept curves that reach 99% of it
-    return float(trapezoid(returns, steps) / steps[-1]) if steps[-1] >= 0.99 * horizon else np.nan
+    return float(trapezoid(returns, steps) / horizon) if steps[-1] >= horizon - 1024 else np.nan
 
 
 def mean_sd(values: list[float]) -> tuple[float, float, int]:
@@ -65,6 +67,13 @@ def mean_sd(values: list[float]) -> tuple[float, float, int]:
     if len(v) == 0:
         return np.nan, np.nan, 0
     return float(v.mean()), float(v.std(ddof=1)) if len(v) > 1 else np.nan, len(v)
+
+
+def gap_z(ours: tuple[float, float, int], paper: tuple[float, float, int]) -> float:
+    if ours[2] == 0 or paper[2] == 0:
+        return np.nan
+    se = np.sqrt(ours[1] ** 2 / ours[2] + paper[1] ** 2 / paper[2])
+    return (ours[0] - paper[0]) / se if se > 0 else np.nan
 
 
 def main() -> None:
@@ -105,8 +114,11 @@ def main() -> None:
             p_auc.append(normalized_auc(g["env_step"].values, g["value"].values, horizon=g["env_step"].iloc[-1]))
         paper_final, paper_auc = mean_sd(p_final), mean_sd(p_auc)
 
-        # gap in units of the combined standard error; |z| > 2 means "does not match the paper"
-        se = np.sqrt((ours_final[1] ** 2 / max(ours_final[2], 1)) + paper_final[1] ** 2 / paper_final[2])
+        for run in done:
+            extra = set(run["curve"]["env_step"].astype(int)) - set(p["env_step"].astype(int))
+            if extra:
+                print(f"WARNING: {task} seed {run['seed']}: eval steps not on the paper's grid: {sorted(extra)[:5]}")
+
         summary_rows.append(
             {
                 "env_name": task,
@@ -116,10 +128,12 @@ def main() -> None:
                 "final_sd": ours_final[1],
                 "paper_final_mean": paper_final[0],
                 "paper_final_sd": paper_final[1],
-                "final_gap_z": (ours_final[0] - paper_final[0]) / se if se > 0 else np.nan,
+                "final_gap_z": gap_z(ours_final, paper_final),
                 "auc_mean": ours_auc[0],
                 "auc_sd": ours_auc[1],
                 "paper_auc_mean": paper_auc[0],
+                "paper_auc_sd": paper_auc[1],
+                "auc_gap_z": gap_z(ours_auc, paper_auc),
                 "train_time_h": mean_sd([r["train_time_h"] for r in done])[0],
                 "update_time_h": mean_sd([r["update_time_h"] for r in done])[0],
                 "collect_time_h": mean_sd([r["collect_time_h"] for r in done])[0],
