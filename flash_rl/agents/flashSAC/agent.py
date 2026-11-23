@@ -371,6 +371,11 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
 
         self._critic_observation_dim: int = observation_space.shape[-1]  # type: ignore
         self._action_dim: int = action_space.shape[-1]  # type: ignore
+        if env_info.get("asymmetric_obs", False) and not cfg.asymmetric_observation:
+            raise ValueError(
+                "The env returns [actor obs, privileged critic obs]; set agent.asymmetric_observation=true, "
+                "otherwise the actor would be trained on the privileged observations."
+            )
         if cfg.asymmetric_observation:
             self._actor_observation_dim = env_info["actor_observation_size"][-1]
         else:

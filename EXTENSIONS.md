@@ -58,6 +58,28 @@ for all runs of a delay comparison (it also changes the `d=2` baseline).
 
 runs the four IsaacLab humanoid tasks for each seed; see the examples at the top of the script.
 
+## Privileged critic (IsaacLab)
+
+IsaacLab adds noise to the policy observations (joint velocities ±1.5, base angular velocity ±0.2, height scan ±0.1,
+...). `env.privileged_critic=true` adds a `critic` observation group, a copy of the policy terms with the noise turned
+off (`add_privileged_critic_group` in `flash_rl/envs/isaaclab.py`). The env then returns `[policy obs, critic obs]`;
+with `agent.asymmetric_observation=true` the actor reads only the first (noisy) part and the critic reads both, so the
+trained policy takes the same inputs as before.
+
+    scripts/run_humanoid.sh privcritic env.privileged_critic=true agent.asymmetric_observation=true
+
+- Set both keys. The agent refuses to start with `env.privileged_critic=true` alone, because the actor would then be
+  trained on the noise-free observations.
+- The stored observation doubles in size (Rough-H1: 256 → 512), and so does the replay buffer: about 41 GB for
+  Rough-H1 with 10M transitions. Add `agent.buffer_device_type=cpu` when it does not fit on the GPU.
+- `play_isaaclab.py` needs the same two overrides to load a checkpoint trained this way.
+- Before this change `agent.asymmetric_observation=true` had no effect on IsaacLab tasks: the check for a `critic`
+  group was always false, and the combined observation shape was built by concatenating two shape tuples.
+- A task that already defines its own `critic` group is not supported yet (`privileged_critic=true` raises).
+
+H1, 3 seeds, 50M steps, final return (mean ± s.e.) against `uniform_d2`: Flat-H1 40.04 ± 0.34 vs. 38.72 ± 0.59,
+Rough-H1 31.51 ± 0.26 vs. 28.12 ± 0.63; about 6–10% fewer env steps per second. G1 has not been run.
+
 ## Logs
 
 Each run writes `logs/<group_name>/<exp_name>/<env_name>/seed<seed>_<time>/`:

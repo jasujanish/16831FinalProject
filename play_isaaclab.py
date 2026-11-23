@@ -55,6 +55,7 @@ def play(args: argparse.Namespace) -> None:
         video_dir=video_dir,
         video_length=args.video_length,
         follow_robot=args.follow_robot,
+        privileged_critic=bool(cfg.env.get("privileged_critic", False)),
     )
 
     # Create agent using config (same as train.py)
