@@ -47,17 +47,31 @@ class TorchUniformBuffer(BaseBuffer):
         sampler: str = "uniform",
         swd_decay_steps: int = 2000,
         swd_min_weight: float = 0.1,
+        window_start_size: int = 1_000_000,
+        window_end_size: int = 10_000_000,
+        window_grow_start: int = 15_000_000,
+        window_grow_end: int = 30_000_000,
     ):
         """
-        sampler: "uniform", or "swd" for WarpSAC's Sample Weight Decay (recency-biased sampling).
+        sampler: "uniform", "swd" for WarpSAC's Sample Weight Decay (recency-biased sampling), or "window" for
+            uniform sampling from the newest transitions only, with a window that grows during training.
         swd_decay_steps: SWD decay horizon, in interaction steps (one step = one `add` call).
         swd_min_weight: SWD weight floor for transitions older than the decay horizon.
+        window_start_size, window_end_size: window length before and after the growth phase, in transitions.
+        window_grow_start, window_grow_end: the window grows linearly between these two numbers of transitions added.
         """
-        assert sampler in ("uniform", "swd"), f"Unknown buffer sampler: {sampler}"
+        assert sampler in ("uniform", "swd", "window"), f"Unknown buffer sampler: {sampler}"
         assert swd_decay_steps > 0 and 0.0 < swd_min_weight <= 1.0
         self._sampler = sampler
         self._swd_decay_steps = swd_decay_steps
         self._swd_min_weight = swd_min_weight
+        if sampler == "window":
+            assert 0 < window_start_size <= window_end_size <= max_length, "need 0 < start <= end <= max_length"
+            assert 0 <= window_grow_start <= window_grow_end
+        self._window_start_size = window_start_size
+        self._window_end_size = window_end_size
+        self._window_grow_start = window_grow_start
+        self._window_grow_end = window_grow_end
         super(TorchUniformBuffer, self).__init__(
             observation_space,
             action_space,
@@ -106,6 +120,7 @@ class TorchUniformBuffer(BaseBuffer):
         self._n_step_transitions: deque[dict[str, Any]] = deque(maxlen=self._n_step)
         self._num_in_buffer = 0
         self._current_idx = 0
+        self._num_added = 0  # transitions ever added, including overwritten ones; drives the window schedule
         self._add_batch_size = 1  # transitions written per `add` call (= number of train envs)
 
     def _to_tensor(self, value: Any) -> torch.Tensor:
@@ -177,6 +192,7 @@ class TorchUniformBuffer(BaseBuffer):
 
             self._num_in_buffer = min(self._num_in_buffer + add_batch_size, self._max_length)
             self._current_idx = (self._current_idx + add_batch_size) % self._max_length
+            self._num_added += add_batch_size
 
     def can_sample(self) -> bool:
         return self._num_in_buffer >= self._min_length
@@ -201,12 +217,38 @@ class TorchUniformBuffer(BaseBuffer):
         idxs: torch.Tensor = (self._current_idx - 1 - slot_ages) % self._max_length
         return idxs
 
+    @property
+    def window_length(self) -> int:
+        """Number of newest transitions that `sample` draws from."""
+        if self._sampler != "window":
+            return self._num_in_buffer
+        if self._num_added < self._window_grow_start:
+            length = self._window_start_size
+        elif self._num_added >= self._window_grow_end:
+            length = self._window_end_size
+        else:
+            progress = (self._num_added - self._window_grow_start) / (self._window_grow_end - self._window_grow_start)
+            length = int(self._window_start_size + progress * (self._window_end_size - self._window_start_size))
+        return min(length, self._num_in_buffer)
+
+    def _sample_window_idxs(self, batch_size: int) -> torch.Tensor:
+        """
+        Uniform sampling from the newest `window_length` transitions. The buffer still stores max_length transitions.
+        As long as the window grows by at most one transition per transition added (the defaults: 9M over 15M), its old
+        end never moves back, so a transition that has left the window does not return.
+        """
+        slot_ages = torch.randint(0, self.window_length, (batch_size,), device=self._device)
+        idxs: torch.Tensor = (self._current_idx - 1 - slot_ages) % self._max_length
+        return idxs
+
     def sample(self, sample_idxs: Optional[NDArray] = None, batch_size: Optional[int] = None) -> Batch:
         batch_size = batch_size or self._sample_batch_size
         if sample_idxs is not None:
             idxs = torch.as_tensor(sample_idxs, device=self._device)
         elif self._sampler == "swd":
             idxs = self._sample_swd_idxs(batch_size)
+        elif self._sampler == "window":
+            idxs = self._sample_window_idxs(batch_size)
         else:
             idxs = torch.randint(0, self._num_in_buffer, (batch_size,), device=self._device)
 
@@ -241,6 +283,7 @@ class TorchUniformBuffer(BaseBuffer):
             "num_in_buffer": self._num_in_buffer,
             "current_idx": self._current_idx,
             "add_batch_size": self._add_batch_size,
+            "num_added": self._num_added,
         }
         torch.save(dataset, path)
 
@@ -264,6 +307,9 @@ class TorchUniformBuffer(BaseBuffer):
         self._current_idx = dataset["current_idx"]
         # needed for ages and SWD; buffers saved before this key existed fall back to the next `add`
         self._add_batch_size = dataset.get("add_batch_size", self._add_batch_size)
+        if self._sampler == "window":
+            assert "num_added" in dataset, "this buffer file predates the window sampler: its schedule position is unknown"
+        self._num_added = dataset.get("num_added", n)
         # Note: _n_step_transitions is intentionally not saved/loaded.
         # At most (n_step - 1) in-flight transitions are lost, which is negligible.
         self._n_step_transitions.clear()

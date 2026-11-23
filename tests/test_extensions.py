@@ -111,6 +111,79 @@ def test_swd_distribution(max_length: int, num_steps: int) -> None:
     assert torch.allclose(observed, expected, atol=3e-3)
 
 
+def make_window_buffer(max_length: int, start: int, end: int, grow: tuple[int, int]) -> TorchUniformBuffer:
+    return make_buffer(
+        max_length,
+        sampler="window",
+        window_start_size=start,
+        window_end_size=end,
+        window_grow_start=grow[0],
+        window_grow_end=grow[1],
+    )
+
+
+# NUM_ENVS = 8 transitions per step. 100 is not a multiple of 8; 60 steps wrap both buffers
+@pytest.mark.parametrize("max_length", [100, 160])
+@pytest.mark.parametrize("window", [8, 24, 37, 96])
+def test_window_distribution(max_length: int, window: int) -> None:
+    torch.manual_seed(0)
+    buffer = make_window_buffer(max_length, window, window, (0, 0))
+    for step in range(60):
+        buffer.add(make_transition(step))
+    batch = buffer.sample(batch_size=200_000)
+    assert torch.equal(batch["age"], 59 - batch["observation"][:, 0])
+
+    # uniform over exactly the newest `window` transitions: full steps of 8, plus a part of the oldest step
+    counts = torch.bincount(batch["age"].long()).float() / 200_000
+    steps = -(-window // NUM_ENVS)
+    expected = torch.tensor([min(NUM_ENVS, window - NUM_ENVS * i) / window for i in range(steps)])
+    assert torch.allclose(counts, expected, atol=5e-3)
+
+
+def test_window_schedule() -> None:
+    buffer = make_window_buffer(800, 80, 400, (800, 1600))
+    lengths, oldest = [], []
+    for step in range(300):
+        buffer.add(make_transition(step))
+        lengths.append(buffer.window_length)
+        oldest.append(buffer._num_added - buffer.window_length)  # index of the oldest transition in the window
+    added = [8 * (i + 1) for i in range(300)]
+    for n, length in zip(added, lengths):
+        if n < 800:
+            assert length == min(n, 80)
+        elif n >= 1600:
+            assert length == 400
+        else:
+            assert length == int(80 + (n - 800) / 800 * 320)
+    # growth rate 0.4 < 1: a transition that has left the window never returns
+    assert all(b >= a for a, b in zip(oldest, oldest[1:]))
+
+
+def test_window_limits() -> None:
+    # never longer than what is stored, and other samplers draw from the whole buffer
+    buffer = make_window_buffer(800, 400, 800, (0, 0))
+    buffer.add(make_transition(0))
+    assert buffer.window_length == NUM_ENVS
+    uniform = make_buffer(800)
+    uniform.add(make_transition(0))
+    assert uniform.window_length == len(uniform) == NUM_ENVS
+    for start, end, grow in [(0, 80, (0, 0)), (160, 80, (0, 0)), (80, 801, (0, 0)), (80, 160, (10, 5))]:
+        with pytest.raises(AssertionError):
+            make_window_buffer(800, start, end, grow)
+
+
+def test_window_save_load(tmp_path) -> None:
+    # the schedule counts every transition ever added, not the number stored
+    buffer = make_window_buffer(160, 16, 160, (400, 1200))
+    for step in range(100):
+        buffer.add(make_transition(step))
+    path = str(tmp_path / "buffer" / "replay_buffer.pt")
+    buffer.save(path)
+    loaded = make_window_buffer(160, 16, 160, (400, 1200))
+    loaded.load(path)
+    assert loaded.window_length == buffer.window_length == int(16 + 0.5 * 144)
+
+
 def test_fixed_actor_delay_matches_modulo() -> None:
     for period in (1, 2, 4, 8):
         delay = ActorDelay("fixed", period, interval=10, beta=0.9, scale=2.0, min_delay=1.0, max_delay=8.0)
@@ -146,7 +219,7 @@ def test_ema_actor_delay() -> None:
     assert restored.state_dict() == delay.state_dict()
 
 
-@pytest.mark.parametrize("sampler", ["uniform", "swd", "laber"])
+@pytest.mark.parametrize("sampler", ["uniform", "swd", "laber", "window"])
 @pytest.mark.parametrize("actor_delay", ["fixed", "ema"])
 def test_agent_update(sampler: str, actor_delay: str) -> None:
     agent = make_agent(
@@ -154,6 +227,10 @@ def test_agent_update(sampler: str, actor_delay: str) -> None:
         f"agent.actor_delay={actor_delay}",
         "agent.actor_delay_ema_interval=5",
         "agent.swd_decay_steps=20",
+        "agent.window_start_size=200",
+        "agent.window_end_size=400",
+        "agent.window_grow_start=100",
+        "agent.window_grow_end=10_000",
     )
     infos = [agent.update() for _ in range(30)]
     for info in infos:
