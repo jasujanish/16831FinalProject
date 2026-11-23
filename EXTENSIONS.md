@@ -15,7 +15,7 @@ All keys live in `configs/agent/flashSAC.yaml` and are set with `--overrides age
 | `actor_delay` | `fixed`, `ema` | Actor delay rule |
 | `actor_update_period` | `2` | Delay `d` for `actor_delay=fixed` |
 | `actor_delay_ema_interval` | `100` | `k`: critic updates between delay recomputations |
-| `actor_delay_ema_beta` | `0.9` | EMA decay, applied once per interval |w
+| `actor_delay_ema_beta` | `0.9` | EMA decay, applied once per interval |
 | `actor_delay_ema_scale` | `2.0` | Delay when the TD error equals its EMA |
 | `actor_delay_ema_min` / `_max` | `1.0` / `8.0` | Clip range of the delay |
 | `actor_lr_schedule` | `actor_step`, `global_step` | What drives the actor/temperature learning-rate schedule |

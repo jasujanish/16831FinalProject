@@ -86,6 +86,13 @@ class IsaacLabVectorEnv(
             num_envs=num_envs,
         )
         env_cfg.seed = seed
+        # Debug-visualization markers (e.g. the velocity-command arrows) only appear in rendered frames, and creating
+        # their materials can hang on headless servers. Skip them unless a video is recorded.
+        commands_cfg = getattr(env_cfg, "commands", None)  # direct-workflow envs have no command manager
+        if headless and not record_video and commands_cfg is not None:
+            for term_cfg in vars(commands_cfg).values():
+                if hasattr(term_cfg, "debug_vis"):
+                    term_cfg.debug_vis = False
         self.seed = seed
         self.device = device
         if follow_robot:
