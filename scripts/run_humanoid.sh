@@ -21,6 +21,11 @@
 exp_name=${1:?usage: scripts/run_humanoid.sh <exp_name> [agent overrides...]}
 shift
 
+# Compile every run from scratch. With kernels reused from torch.compile's on-disk cache, runs intermittently crash at
+# their first update ("live storage data ptrs are in the cudagraph pool but not accounted for as an output of
+# cudagraph trees"); every crash so far started from a warm cache. Costs ~1-2 min of compilation per run.
+export TORCHINDUCTOR_FX_GRAPH_CACHE=0 TORCHINDUCTOR_AUTOGRAD_CACHE=0
+
 extra_overrides=()
 for override in "$@"; do
     extra_overrides+=(--overrides "$override")
