@@ -59,6 +59,7 @@ class FlashSACConfig:
 
     actor_num_blocks: int
     actor_hidden_dim: int
+    block_type: str
     actor_bc_alpha: float
     actor_noise_zeta_mu: float
     actor_noise_zeta_max: int
@@ -129,6 +130,7 @@ def _init_flashsac_networks(
         input_dim=actor_observation_dim,
         hidden_dim=cfg.actor_hidden_dim,
         action_dim=action_dim,
+        block_type=cfg.block_type,
     ).to(device)
 
     use_fused = device.type == "cuda" and torch.cuda.is_available()
@@ -154,6 +156,7 @@ def _init_flashsac_networks(
         num_bins=cfg.critic_num_bins,
         min_v=cfg.critic_min_v,
         max_v=cfg.critic_max_v,
+        block_type=cfg.block_type,
     ).to(device)
 
     critic_optimizer = optim.Adam(
@@ -182,6 +185,7 @@ def _init_flashsac_networks(
         num_bins=cfg.critic_num_bins,
         min_v=cfg.critic_min_v,
         max_v=cfg.critic_max_v,
+        block_type=cfg.block_type,
     ).to(device)
     target_critic_net.load_state_dict(critic_net.state_dict())
     target_critic = Network(

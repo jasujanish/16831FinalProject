@@ -23,10 +23,11 @@ class FlashSACActor(nn.Module):
         input_dim: int,
         hidden_dim: int,
         action_dim: int,
+        block_type: str = "relu",
     ):
         super().__init__()
         self.embedder = FlashSACEmbedder(input_dim=input_dim, hidden_dim=hidden_dim)
-        self.encoder = nn.ModuleList([FlashSACBlock(hidden_dim) for _ in range(num_blocks)])
+        self.encoder = nn.ModuleList([FlashSACBlock(hidden_dim, block_type) for _ in range(num_blocks)])
         self.post_norm = UnitRMSNorm(hidden_dim)
         self.predictor = NormalTanhPolicy(hidden_dim=hidden_dim, action_dim=action_dim)
 
@@ -75,12 +76,13 @@ class FlashSACDoubleCritic(nn.Module):
         min_v: float,
         max_v: float,
         num_qs: int = 2,
+        block_type: str = "relu",
     ):
         super().__init__()
         self.num_qs = num_qs
 
         self.embedder = EnsembleFlashSACEmbedder(num_qs, input_dim, hidden_dim)
-        self.encoder = nn.ModuleList([EnsembleFlashSACBlock(num_qs, hidden_dim) for _ in range(num_blocks)])
+        self.encoder = nn.ModuleList([EnsembleFlashSACBlock(num_qs, hidden_dim, block_type) for _ in range(num_blocks)])
         self.post_norm = EnsembleUnitRMSNorm(num_qs, hidden_dim)
         self.predictor = EnsembleCategoricalValue(
             num_ensemble=num_qs,

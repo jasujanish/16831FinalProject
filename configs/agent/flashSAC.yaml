@@ -40,6 +40,10 @@ learning_rate_decay_step: ${eval:'int(${agent.learning_rate_decay_rate} *
 
 actor_num_blocks: 2
 actor_hidden_dim: 128
+# Shared actor/critic residual block:
+#   relu (default); linear_bottleneck (2x expansion, no post-projection ReLU);
+#   swiglu (SwiGLU with an approximately parameter-matched inner width).
+block_type: 'relu'
 actor_bc_alpha: 0.0
 actor_noise_zeta_mu: 2.0
 actor_noise_zeta_max: 16

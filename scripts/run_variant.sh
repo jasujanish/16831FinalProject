@@ -36,4 +36,6 @@ kill "${smi_pid}"
 { git rev-parse HEAD; git status --short; uv pip list; nvidia-smi; } > "stdout_logs/provenance_${exp}.txt" 2>&1
 tar czf "${exp}_results_$(date +%m%d-%H%M).tar.gz" "logs/humanoid/${exp}" stdout_logs/*"${exp}"* \
     $(ls -d "models/humanoid/${exp}" "runs/humanoid/${exp}" 2>/dev/null)
-[ "${SHUTDOWN:-1}" = 1 ] && sudo shutdown -h now
+if [ "${SHUTDOWN:-1}" = 1 ]; then
+  sudo shutdown -h now
+fi
