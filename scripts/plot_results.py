@@ -2,6 +2,7 @@
 Plot learning curves and diagnostics from metrics.csv files.
 
 usage: python scripts/plot_results.py [--results_dir results/nish] [--out_dir results/nish/plots] [--time wall|train]
+                                      [--methods crossq crossq_1q ...] [--suffix _critic]
 
 Expects <results_dir>/<method>/<task>/<run>/metrics.csv (the layout of logs/<group>/). Writes two figures per actor
 delay, each with one panel per task and one line per method:
@@ -32,8 +33,17 @@ import numpy as np  # noqa: E402
 
 # Fixed color and marker per base method, so a method looks the same in every figure. Colors are categorical slots
 # 1-8 (light mode, CVD-validated in this order); markers keep methods apart where color alone is not enough.
-METHOD_ORDER = ["baseline", "minto", "crossq", "laber"]
-LABELS = {"baseline": "Baseline", "minto": "MINTO", "crossq": "Online", "laber": "LaBER"}
+METHOD_ORDER = ["baseline", "minto", "crossq", "laber", "crossq_1q", "crossq_1q_w360", "crossq_sw", "crossq_1q_w360_sw"]
+LABELS = {
+    "baseline": "Baseline",
+    "minto": "MINTO",
+    "crossq": "Online",
+    "laber": "LaBER",
+    "crossq_1q": "Online, 1 critic",
+    "crossq_1q_w360": "Online, 1 wide critic",
+    "crossq_sw": "Online + surprise wt.",
+    "crossq_1q_w360_sw": "Online, 1 wide critic + surprise wt.",
+}
 COLORS = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#6250d6", "#e34948"]
 MARKERS = ["o", "s", "^", "D", "v", "P", "X", "*"]
 TASK_ORDER = ["Flat-G1", "Rough-G1", "Flat-H1", "Rough-H1"]
@@ -209,6 +219,9 @@ def main() -> None:
     parser.add_argument("--out_dir", default=None, help="default: <results_dir>/plots")
     parser.add_argument("--time", choices=["wall", "train"], default="wall",
                         help="wall: elapsed time including evaluation; train: training time only (eval excluded)")
+    parser.add_argument("--methods", nargs="+", default=None,
+                        help="only plot these method directories, e.g. --methods crossq crossq_1q crossq_1q_w360")
+    parser.add_argument("--suffix", default="", help="appended to the figure file names, e.g. _critic")
     args = parser.parse_args()
 
     out_dir = args.out_dir or os.path.join(args.results_dir, "plots")
@@ -226,9 +239,13 @@ def main() -> None:
     found = False
     for name, y_key, x_key, y_label, title, opts in figures:
         # one figure per actor delay, so d=2 and d=4 runs are never drawn on the same chart
-        for delay, runs in sorted(by_delay(load(args.results_dir, y_key, x_key)).items()):
+        loaded = load(args.results_dir, y_key, x_key)
+        if args.methods is not None:
+            loaded = {key: value for key, value in loaded.items() if key[0] in args.methods}
+        for delay, runs in sorted(by_delay(loaded).items()):
             found = True
-            plot(runs, opts.get("x_label", steps), y_label, title, os.path.join(out_dir, f"{name}_d{delay}.png"),
+            out_path = os.path.join(out_dir, f"{name}_d{delay}{args.suffix}.png")
+            plot(runs, opts.get("x_label", steps), y_label, title, out_path,
                  log_y=opts.get("log_y", False), note=f"d={delay}" + (f"; {opts['note']}" if "note" in opts else ""))
     if not found:
         raise SystemExit(f"no metrics.csv found under {args.results_dir}/<method>/<task>/<run>/")

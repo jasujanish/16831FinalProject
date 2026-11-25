@@ -145,6 +145,22 @@ def _td_surprise(
     return surprise, td_abs
 
 
+def surprise_weights(surprise: torch.Tensor, alpha: float, w_min: float, w_max: float) -> torch.Tensor:
+    """
+    In-batch prioritization weights for a uniformly sampled batch, shape (B,), mean 1.
+
+        w = clip((surprise / mean(surprise)) ** alpha, w_min, w_max) / mean(...)
+
+    Weighting the loss of uniform samples by p_i / mean(p) has the same expected gradient as sampling with
+    probability p_i (Fujimoto et al., "An Equivalence between Loss Functions and Non-Uniform Sampling in Experience
+    Replay", NeurIPS 2020). The floor w_min keeps low-error samples in the loss (as LAP's minimum priority does);
+    the cap w_max bounds the influence of outliers, e.g. irreducible noise.
+    """
+    w = (surprise.float() / (surprise.float().mean() + 1e-8)).pow(alpha)
+    w = w.clamp(w_min, w_max)
+    return w / w.mean()
+
+
 def pearson_corr(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     x = x - x.mean()
     y = y - y.mean()
@@ -243,7 +259,8 @@ def update_actor(
             actions=actions,
             training=False,
         )
-        q = torch.minimum(qs[0], qs[1])
+        # min over the critic ensemble: clipped double Q for 2 critics, the critic itself for 1
+        q = qs.min(dim=0).values
         critic.network.requires_grad_(True)
 
         temp_value = temperature().detach()
@@ -303,6 +320,9 @@ def update_critic(
     use_amp: bool,
     grad_scaler: Optional[GradScaler],
     critic_target: str = "target",
+    surprise_weight_alpha: float = 0.0,
+    surprise_weight_min: float = 0.5,
+    surprise_weight_max: float = 3.0,
 ) -> dict[str, torch.Tensor]:
     """Update critic network.
 
@@ -322,6 +342,10 @@ def update_critic(
         use_amp: Whether to use automatic mixed precision.
         grad_scaler: GradScaler for FP16 AMP.
         critic_target: Which networks the TD target is built from, see `_select_target_log_probs`.
+        surprise_weight_alpha: If > 0, weight each sample's loss by its surprise, see `surprise_weights`. These
+            weights only scale the loss (the batch is still uniformly sampled, so BatchNorm statistics stay unweighted)
+            and multiply any importance weights in batch["weight"].
+        surprise_weight_min, surprise_weight_max: Clip range of the surprise weights before renormalization.
     """
 
     weights = cast(Optional[torch.Tensor], batch.get("weight"))
@@ -396,15 +420,29 @@ def update_critic(
             )
             max_entropy_bonus = next_actor_entropy.max()
 
-        ce_loss = -(target_probs.unsqueeze(0) * pred_log_probs).sum(dim=-1)  # (2, B)
-        if weights is not None:
-            ce_loss = ce_loss * weights
+        # Per-sample errors (B,), averaged over the critics. Computed before the loss so that they can also weight it;
+        # float32 as before, when they were only diagnostics.
+        with torch.no_grad(), torch.autocast(device_type=device.type, enabled=False):
+            pred_qs = pred_qs_all.chunk(2, dim=1)[0]
+            surprise, td_abs = _td_surprise(pred_qs.detach(), pred_log_probs.detach(), target_probs, min_v, max_v)
+            sample_surprise_weights: Optional[torch.Tensor] = None
+            if surprise_weight_alpha > 0.0:
+                sample_surprise_weights = surprise_weights(
+                    surprise, surprise_weight_alpha, surprise_weight_min, surprise_weight_max
+                )
+
+        # importance weights of a non-uniformly sampled batch (LaBER) times surprise weights; None if neither is used
+        loss_weights = weights
+        if sample_surprise_weights is not None:
+            loss_weights = sample_surprise_weights if loss_weights is None else loss_weights * sample_surprise_weights
+
+        ce_loss = -(target_probs.unsqueeze(0) * pred_log_probs).sum(dim=-1)  # (num_qs, B)
+        if loss_weights is not None:
+            ce_loss = ce_loss * loss_weights
         critic_loss = ce_loss.mean()
 
     # Diagnostics (computed before the gradient step)
     with torch.no_grad():
-        pred_qs = pred_qs_all.chunk(2, dim=1)[0]
-        surprise, td_abs = _td_surprise(pred_qs, pred_log_probs, target_probs, min_v, max_v)
         ages = cast(torch.Tensor, batch["age"])
         age_quantiles = torch.quantile(ages, torch.tensor([0.5, 0.9], device=ages.device))
         if weights is None:
@@ -428,6 +466,14 @@ def update_critic(
             diagnostics["critic_target/gap"] = (target_next_qs.float() - online_next_qs.float()).abs().mean()
         if online_chosen is not None:
             diagnostics["critic_target/online_frac"] = online_chosen.float().mean()
+        if sample_surprise_weights is not None:
+            w = sample_surprise_weights
+            diagnostics["critic/surprise_weight_max"] = w.max()
+            diagnostics["critic/surprise_weight_min"] = w.min()
+            # effective sample fraction (sum w)^2 / (B * sum w^2): 1 = uniform, small = few samples dominate
+            diagnostics["critic/surprise_weight_ess"] = w.sum() ** 2 / (w.numel() * w.square().sum())
+            # how prioritization relates to staleness
+            diagnostics["critic/surprise_weight_age_corr"] = pearson_corr(ages, w)
 
     # Gradient step
     assert critic.optimizer is not None

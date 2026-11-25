@@ -13,6 +13,11 @@
 #   scripts/run_humanoid.sh crossq      agent.critic_target=online
 #   scripts/run_humanoid.sh minto       agent.critic_target=minto
 #   scripts/run_humanoid.sh minto_net   agent.critic_target=minto_net
+#   scripts/run_humanoid.sh crossq_1q          agent.critic_target=online agent.critic_num_qs=1
+#   scripts/run_humanoid.sh crossq_1q_w360     agent.critic_target=online agent.critic_num_qs=1 agent.critic_hidden_dim=360
+#   scripts/run_humanoid.sh crossq_sw          agent.critic_target=online agent.critic_surprise_weight_alpha=0.5
+#   scripts/run_humanoid.sh crossq_1q_w360_sw  agent.critic_target=online agent.critic_num_qs=1 \
+#                                              agent.critic_hidden_dim=360 agent.critic_surprise_weight_alpha=0.5
 #
 # SEEDS and ENVS can be set in the environment, e.g. SEEDS="0 1000" ENVS="Isaac-Velocity-Flat-G1-v0".
 # Metrics are written to logs/humanoid/<exp_name>/<env_name>/seed<seed>_<time>/metrics.csv

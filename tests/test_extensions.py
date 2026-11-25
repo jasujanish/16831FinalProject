@@ -1,5 +1,6 @@
 """
-CPU tests for the project extensions (SWD / LaBER sampling, adaptive actor delay, critic targets, logging).
+CPU tests for the project extensions (SWD / LaBER sampling, adaptive actor delay, critic targets, single critic,
+in-batch surprise weighting, logging).
 
     python -m pytest tests/test_extensions.py
 """
@@ -19,7 +20,8 @@ from omegaconf import OmegaConf
 from flash_rl.agents import create_agent
 from flash_rl.agents.flashSAC.actor_delay import ActorDelay
 from flash_rl.agents.flashSAC.layer import EnsembleUnitBatchNorm
-from flash_rl.agents.flashSAC.update import CRITIC_TARGETS, _select_target_log_probs
+from flash_rl.agents.flashSAC.network import FlashSACDoubleCritic
+from flash_rl.agents.flashSAC.update import CRITIC_TARGETS, _select_target_log_probs, surprise_weights
 from flash_rl.buffers.torch_buffer import TorchUniformBuffer
 from flash_rl.common.logger import CsvTrainerLogger
 
@@ -289,6 +291,95 @@ def test_online_checkpoint_saves_current_critic_as_target(tmp_path) -> None:
 def test_laber_requires_target_network() -> None:
     with pytest.raises(AssertionError, match="LaBER"):
         make_agent("agent.sampler=laber", "agent.critic_target=minto")
+
+
+def num_params(network) -> int:
+    return sum(p.numel() for p in network.parameters())
+
+
+@pytest.mark.parametrize("critic_target", ["online", "target"])
+def test_single_critic(critic_target: str) -> None:
+    pair = make_agent(f"agent.critic_target={critic_target}")
+    single = make_agent(f"agent.critic_target={critic_target}", "agent.critic_num_qs=1")
+    assert single._critic.network.num_qs == 1 and single._target_critic.network.num_qs == 1
+    # one critic of the same shape has half the parameters of the pair
+    assert num_params(single._critic.network) * 2 == num_params(pair._critic.network)
+    infos = [single.update() for _ in range(20)]
+    for info in infos:
+        assert all(np.isfinite(v) for v in info.values()), info
+    assert sum("actor/loss" in i for i in infos) == 10
+
+
+def test_single_wider_critic_matches_pair_size() -> None:
+    # Run 2: one critic at width 360 has about as many parameters as the default pair at width 256
+    with hydra.initialize(version_base=None, config_path="../configs"):
+        cfg = hydra.compose("flashSAC_base")
+    critic_input_dim = 310 + 37  # Rough-G1: observation + action
+    pair = FlashSACDoubleCritic(cfg.agent.critic_num_blocks, critic_input_dim, 256, 101, -5.0, 5.0, num_qs=2)
+    single = FlashSACDoubleCritic(cfg.agent.critic_num_blocks, critic_input_dim, 360, 101, -5.0, 5.0, num_qs=1)
+    assert num_params(single) == pytest.approx(num_params(pair), rel=0.05)
+
+
+def test_surprise_weights() -> None:
+    torch.manual_seed(0)
+    surprise = torch.rand(4096).exp()
+    w = surprise_weights(surprise, alpha=0.5, w_min=0.5, w_max=3.0)
+    assert w.shape == surprise.shape
+    assert float(w.mean()) == pytest.approx(1.0, abs=1e-5)
+    # monotone in surprise, and close to the clip range (the renormalization shifts it slightly)
+    order = surprise.argsort()
+    assert (w[order].diff() >= -1e-6).all()
+    assert 0.4 < float(w.min()) and float(w.max()) < 3.5
+    # alpha = 0 gives uniform weights; alpha = 1 with a wide clip range gives weights proportional to surprise
+    assert torch.allclose(surprise_weights(surprise, 0.0, 0.5, 3.0), torch.ones(4096))
+    w1 = surprise_weights(surprise, 1.0, 1e-6, 1e6)
+    assert torch.allclose(w1, surprise / surprise.mean(), atol=1e-5)
+
+
+def test_surprise_weighting_only_changes_the_loss() -> None:
+    # same seed and batch: identical forward pass and errors, different loss
+    infos = {}
+    for alpha in (0.0, 0.5):
+        torch.manual_seed(0)
+        agent = make_agent("agent.critic_target=online", f"agent.critic_surprise_weight_alpha={alpha}")
+        torch.manual_seed(1)
+        infos[alpha] = agent.update()
+    off, on = infos[0.0], infos[0.5]
+    assert on["critic/td_abs"] == pytest.approx(off["critic/td_abs"], rel=1e-6)
+    assert on["critic/surprise"] == pytest.approx(off["critic/surprise"], rel=1e-6)
+    assert on["critic/loss"] != pytest.approx(off["critic/loss"], rel=1e-6)
+    assert "critic/surprise_weight_ess" not in off
+    assert 0.0 < on["critic/surprise_weight_ess"] <= 1.0
+    assert 0.4 < on["critic/surprise_weight_min"] <= 1.0 <= on["critic/surprise_weight_max"] < 3.5
+
+
+@pytest.mark.parametrize("num_qs, hidden_dim", [(2, 256), (1, 360)])
+def test_surprise_weighting_runs(num_qs: int, hidden_dim: int) -> None:
+    # Runs 3 and 4: surprise weighting on the default pair and on one wider critic, without a target network
+    agent = make_agent(
+        "agent.critic_target=online",
+        "agent.critic_surprise_weight_alpha=0.5",
+        f"agent.critic_num_qs={num_qs}",
+        f"agent.critic_hidden_dim={hidden_dim}",
+    )
+    infos = [agent.update() for _ in range(20)]
+    for info in infos:
+        assert all(np.isfinite(v) for v in info.values()), info
+    assert "critic/surprise_weight_age_corr" in infos[-1]
+
+
+def test_surprise_weighting_combines_with_laber() -> None:
+    agent = make_agent("agent.sampler=laber", "agent.critic_surprise_weight_alpha=0.5")
+    infos = [agent.update() for _ in range(10)]
+    for info in infos:
+        assert all(np.isfinite(v) for v in info.values()), info
+
+
+def test_invalid_critic_options() -> None:
+    with pytest.raises(AssertionError, match="critic_num_qs"):
+        make_agent("agent.critic_num_qs=0")
+    with pytest.raises(AssertionError):
+        make_agent("agent.critic_surprise_weight_min=2.0")
 
 
 def test_buffer_save_load(tmp_path) -> None:

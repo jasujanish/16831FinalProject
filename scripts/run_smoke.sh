@@ -6,6 +6,7 @@
 #
 #   scripts/run_smoke.sh
 #   scripts/run_smoke.sh smoke_minto smoke_crossq
+#   scripts/run_smoke.sh smoke_1q smoke_1q_w360 smoke_sw smoke_1q_w360_sw     # critic runs 1-4
 #
 # Console output of each run is also written to ~/<exp_name>.log.
 ##################################################################################
@@ -18,6 +19,11 @@ declare -A overrides=(
     [smoke_minto]="agent.critic_target=minto"
     [smoke_crossq]="agent.critic_target=online"
     [smoke_laber]="agent.sampler=laber"
+    # critic runs 1-4 (not in the default list; pass them by name)
+    [smoke_1q]="agent.critic_target=online agent.critic_num_qs=1"
+    [smoke_1q_w360]="agent.critic_target=online agent.critic_num_qs=1 agent.critic_hidden_dim=360"
+    [smoke_sw]="agent.critic_target=online agent.critic_surprise_weight_alpha=0.5"
+    [smoke_1q_w360_sw]="agent.critic_target=online agent.critic_num_qs=1 agent.critic_hidden_dim=360 agent.critic_surprise_weight_alpha=0.5"
 )
 
 exps=("$@")

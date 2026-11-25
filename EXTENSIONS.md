@@ -20,6 +20,9 @@ All keys live in `configs/agent/flashSAC.yaml` and are set with `--overrides age
 | `actor_delay_ema_min` / `_max` | `1.0` / `8.0` | Clip range of the delay |
 | `actor_lr_schedule` | `actor_step`, `global_step` | What drives the actor/temperature learning-rate schedule |
 | `critic_target` | `target`, `online`, `minto`, `minto_net` | Which networks the TD target is built from |
+| `critic_num_qs` | `2` | Critics in the ensemble. `1` = a single critic, no clipped double Q |
+| `critic_surprise_weight_alpha` | `0.0` | In-batch surprise weighting of the critic loss (`0` = off) |
+| `critic_surprise_weight_min` / `_max` | `0.5` / `3.0` | Clip range of the surprise weights |
 
 `log_csv` (default `true`, in `configs/flashSAC_base.yaml`) turns the CSV log on or off.
 
@@ -65,7 +68,26 @@ categorical TD target from it as before. The online candidates are the next-stat
 | `minto` | the 2 target + the 2 online critics | MINTO ([Hendawy et al.](https://arxiv.org/abs/2510.02590)); never above `target` |
 | `minto_net` | mean of the 2 target critics vs. mean of the 2 online critics | MINTO without clipped double Q: all pessimism comes from the online-vs-target minimum |
 
-The actor objective is unchanged (`min` of the 2 online critics). LaBER scoring always uses the target network, so
+The actor objective is unchanged (`min` over the online critics).
+
+**Single critic** (`critic_num_qs=1`). The critic ensemble has one member instead of two, for the critic and the target
+critic alike. The `min` over critics in the TD target and the actor objective is then the critic itself, so there is no
+clipped double Q. With the same width the critic has half the parameters of the default pair; `critic_hidden_dim=360`
+gives about the same number of parameters as the pair at width 256 (2.18M vs 2.24M on Flat-G1, 2.24M vs 2.34M on
+Rough-G1). The default `critic_num_qs=2` reproduces the previous updates exactly.
+
+**In-batch surprise weighting** (`critic_surprise_weight_alpha > 0`, `surprise_weights` in
+`flash_rl/agents/flashSAC/update.py`). The batch is still sampled uniformly. Each sample's cross-entropy is weighted by
+
+    w = clip((surprise / mean surprise) ** alpha, min, max), renormalized to mean 1 over the batch
+
+with `surprise` as above, computed from the same forward pass as the loss (no extra network call). Weighting the loss of
+uniform samples by `p_i / mean(p)` has the same expected gradient as sampling with probability `p_i` (Fujimoto, Meger &
+Precup, "An Equivalence between Loss Functions and Non-Uniform Sampling in Experience Replay", NeurIPS 2020), so this is
+prioritized replay without importance correction, with priorities that are fresh on every batch. Unlike LaBER, which
+corrects its selection with importance weights and so keeps the uniform expected gradient, this deliberately changes it.
+The weights scale only the critic loss: BatchNorm statistics (the batch is uniform) and the actor update are unchanged.
+Under LaBER they multiply its importance weights. LaBER scoring always uses the target network, so
 `sampler=laber` requires `critic_target=target`. The online pass now runs before the target pass, which does not change
 the `target` results (the two networks share no state).
 
@@ -106,6 +128,8 @@ Each run writes `logs/<group_name>/<exp_name>/<env_name>/seed<seed>_<time>/`:
 | `actor_delay/actor_updated` | Fraction of critic updates that also updated the actor |
 | `laber/candidate_*` | Surprise, TD error, age and their correlation over the uniform candidates |
 | `laber/effective_sample_frac`, `weight_max`, `unique_frac` | How concentrated the LaBER selection is |
+| `critic/surprise_weight_min`, `_max`, `_ess` | Range of the surprise weights and their effective sample fraction (1 = uniform) |
+| `critic/surprise_weight_age_corr` | Pearson correlation between sample age and surprise weight |
 
 ## Videos
 

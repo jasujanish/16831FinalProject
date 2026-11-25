@@ -72,6 +72,17 @@ critic_target_update_tau: 0.01
 #   minto:     MINTO: the 2 target and the 2 online critics.
 #   minto_net: MINTO between networks: the mean of the 2 target critics vs. the mean of the 2 online critics.
 critic_target: 'target'   # ['target', 'online', 'minto', 'minto_net']
+# Number of critics in the ensemble. With 1 there is no clipped double Q: the TD target and the actor
+# objective use the single critic (the "min" over one critic is the critic itself).
+critic_num_qs: 2
+# In-batch surprise weighting of the critic loss (0 = off). Each sample's cross-entropy is weighted by
+#   w = clip((surprise / batch-mean surprise) ** alpha, min, max), renormalized to mean 1,
+# where surprise = ||softmax(logits) - target_probs||_2, averaged over the critics. With uniform sampling this has the
+# expected gradient of prioritized replay without importance correction (Fujimoto et al., NeurIPS 2020), using
+# priorities computed fresh on every batch. BatchNorm statistics and the actor update are not weighted.
+critic_surprise_weight_alpha: 0.0
+critic_surprise_weight_min: 0.5
+critic_surprise_weight_max: 3.0
 
 temp_initial_value: 0.01
 temp_target_sigma: 0.15

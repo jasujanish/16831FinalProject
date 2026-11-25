@@ -79,6 +79,10 @@ class FlashSACConfig:
     critic_max_v: float
     critic_target_update_tau: float
     critic_target: str  # 'target' | 'online' | 'minto' | 'minto_net'
+    critic_num_qs: int
+    critic_surprise_weight_alpha: float
+    critic_surprise_weight_min: float
+    critic_surprise_weight_max: float
 
     temp_initial_value: float
     temp_target_sigma: float
@@ -156,6 +160,7 @@ def _init_flashsac_networks(
         num_bins=cfg.critic_num_bins,
         min_v=cfg.critic_min_v,
         max_v=cfg.critic_max_v,
+        num_qs=cfg.critic_num_qs,
     ).to(device)
 
     critic_optimizer = optim.Adam(
@@ -184,6 +189,7 @@ def _init_flashsac_networks(
         num_bins=cfg.critic_num_bins,
         min_v=cfg.critic_min_v,
         max_v=cfg.critic_max_v,
+        num_qs=cfg.critic_num_qs,
     ).to(device)
     target_critic_net.load_state_dict(critic_net.state_dict())
     target_critic = Network(
@@ -333,6 +339,9 @@ def _update_networks(
         use_amp=cfg.use_amp,
         grad_scaler=grad_scaler,
         critic_target=cfg.critic_target,
+        surprise_weight_alpha=cfg.critic_surprise_weight_alpha,
+        surprise_weight_min=cfg.critic_surprise_weight_min,
+        surprise_weight_max=cfg.critic_surprise_weight_max,
     )
 
     # without a target network (CrossQ-style) the target critic is unused and keeps its initial weights
@@ -407,6 +416,9 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
         assert cfg.critic_target in CRITIC_TARGETS, f"Unknown critic target: {cfg.critic_target}"
         # LaBER's scoring (`compute_td_surprise`) always builds its targets from the target network
         assert cfg.sampler != "laber" or cfg.critic_target == "target", "LaBER requires critic_target='target'"
+        assert cfg.critic_num_qs >= 1, f"critic_num_qs must be >= 1, got {cfg.critic_num_qs}"
+        assert cfg.critic_surprise_weight_alpha >= 0.0
+        assert 0.0 < cfg.critic_surprise_weight_min <= 1.0 <= cfg.critic_surprise_weight_max
         self._update_step = 0
         self._lr_schedule = _make_lr_schedule(cfg)
         self._actor_delay = ActorDelay(
