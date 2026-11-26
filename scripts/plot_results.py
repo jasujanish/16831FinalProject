@@ -15,6 +15,17 @@ plus, for the d=2 methods, the normalized area under the return curve (auc.png a
 0-50M steps, and the mean return over a common time budget per task (the shortest final time of any run on it).
 The wall-clock figure labels each line "<method> (<final return>, <mean final time> min)".
 
+paper_vs_baseline.png / .csv compare our baseline (--paper_method) with the FlashSAC paper (--paper_csv): final return
+and AUC, ours - paper, in % and as z = difference / combined standard error.
+
+Step axis: every step-based figure and AUC uses the logging step (`env_step`), where each eval is recorded at the next
+logging step (the 5.00M eval at 5.50M, ...). The FlashSAC paper's CSV and scripts/compare_baseline.py use the same
+axis, so all AUCs here are directly comparable with the paper's and the team's. (`eval_env_step`, the exact step of
+an eval, would shift the curves ~0.5M steps left and raise every AUC by ~0.35.)
+
+Asymmetric-critic runs: a method named <method>_asym (e.g. crossq_1q_w360_asym) is drawn in the color and marker of
+<method>, with a dashed line and a hollow marker, and labeled "<method label> + asym. critic".
+
 Rafay's runs, compared with our baseline:
     python scripts/plot_results.py --results_dir results/rafay results/nish \
         --methods baseline architecture_linear_bottleneck architecture_swiglu --out_dir results/rafay/plots
@@ -55,6 +66,10 @@ LABELS = {
     "crossq_1q_w360_sw": "Online, 1 wide critic + surprise wt.",
     "architecture_linear_bottleneck": "Linear bottleneck",
     "architecture_swiglu": "SwiGLU",
+    # asymmetric-critic variants (run_humanoid.sh --asym); any other <method>_asym gets "<label> + asym. critic"
+    "crossq_asym": "Online + asym. critic",
+    "crossq_1q_asym": "Online, 1 critic + asym. critic",
+    "crossq_1q_w360_asym": "Online, 1 wide critic + asym. critic",
 }
 COLORS = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#6250d6", "#e34948"]
 MARKERS = ["o", "s", "^", "D", "v", "P", "X", "*"]
@@ -65,11 +80,29 @@ MARKER_SCALE = {"*": 1.8}  # the star draws much smaller than the other markers 
 SLOTS = {m: i for i, m in enumerate(METHOD_ORDER[:8])} | {"architecture_linear_bottleneck": 3, "architecture_swiglu": 7}
 
 
+ASYM_SUFFIX = "_asym"  # asymmetric-critic variant of a method (run_humanoid.sh --asym)
+
+
+def asym_partner(base: str) -> tuple[str, bool]:
+    """'crossq_1q_asym' -> ('crossq_1q', True); 'crossq_1q' -> ('crossq_1q', False)."""
+    return (base[: -len(ASYM_SUFFIX)], True) if base.endswith(ASYM_SUFFIX) else (base, False)
+
+
 def style(base: str) -> tuple[str, str]:
-    """(color, marker) of a base method: its fixed slot, or the next free slot for a method not listed above."""
+    """(color, marker) of a base method: its fixed slot, or the next free slot for a method not listed above.
+    An asymmetric variant shares its partner's slot; line_style() and hollow() tell the two apart."""
+    base = asym_partner(base)[0]
     if base not in SLOTS:
         SLOTS[base] = len(SLOTS) % len(COLORS)
     return COLORS[SLOTS[base]], MARKERS[SLOTS[base] % len(MARKERS)]
+
+
+def is_asym(method: str) -> bool:
+    return asym_partner(split_method(method)[0])[1]
+
+
+def line_style(method: str) -> str:
+    return "--" if is_asym(method) else "-"
 TASK_ORDER = ["Flat-G1", "Rough-G1", "Flat-H1", "Rough-H1"]
 
 SURFACE, TEXT, TEXT_2, GRID = "#fcfcfb", "#0b0b0b", "#52514e", "#e4e3df"
@@ -87,7 +120,8 @@ def split_method(method: str) -> tuple[str, Optional[int]]:
 
 def label(method: str) -> str:
     base, delay = split_method(method)
-    name = LABELS.get(base, base)
+    partner, asym = asym_partner(base)
+    name = LABELS.get(base) or (f"{LABELS.get(partner, partner)} + asym. critic" if asym else base)
     return f"{name} (d={delay})" if delay is not None else name
 
 
@@ -135,10 +169,12 @@ def by_delay(runs: dict) -> dict[int, dict]:
     return groups
 
 
-def method_sort_key(method: str) -> tuple[int, str, int]:
+def method_sort_key(method: str) -> tuple[int, int, str, int]:
+    """Order of the methods in legends and tables; an asymmetric variant comes right after its partner."""
     base, delay = split_method(method)
-    rank = METHOD_ORDER.index(base) if base in METHOD_ORDER else len(METHOD_ORDER)
-    return rank, base, delay or 0
+    partner, asym = asym_partner(base)
+    rank = METHOD_ORDER.index(partner) if partner in METHOD_ORDER else len(METHOD_ORDER)
+    return rank, int(asym), partner, delay or 0
 
 
 def spread_labels(ys: list[float], min_gap: float) -> list[float]:
@@ -181,7 +217,10 @@ def plot(
             y = np.stack([r["y"] for r in rs])
             mean = y.mean(0)
             every = max(1, len(x) // 10)  # about 10 markers per line, also for the dense training metrics
-            ax.plot(x, mean, color=color, lw=2, marker=marker, ms=5 * MARKER_SCALE.get(marker, 1), markevery=every, mec=SURFACE, mew=1.2,
+            hollow = is_asym(method)  # asymmetric variant: dashed line, hollow marker in the partner's color
+            ax.plot(x, mean, color=color, lw=2, ls=line_style(method), marker=marker,
+                    ms=5 * MARKER_SCALE.get(marker, 1), markevery=every, mfc=SURFACE if hollow else color,
+                    mec=color if hollow else SURFACE, mew=1.4 if hollow else 1.2,
                     label=label(method), zorder=3)
             if len(rs) > 1:
                 ax.fill_between(x, y.min(0), y.max(0), color=color, alpha=0.15, lw=0, zorder=2)
@@ -251,11 +290,11 @@ def mean_return_until(x: np.ndarray, y: np.ndarray, budget: float) -> float:
 def auc_table(results_dir: list[str], time_key: str, methods: Optional[list[str]]) -> list[dict]:
     """Normalized area under the eval-return curve per method and task, two ways:
 
-    steps: mean return over [0, final step]. Same definition as scripts/compare_baseline.py.
+    steps: mean return over [0, final step], on the logging-step axis. Same as scripts/compare_baseline.py.
     time:  mean return over [0, T], with T the shortest final time of any run of that task, so every method gets the
            same time budget and no curve is extrapolated.
     """
-    steps = {k: v for k, v in load(results_dir, "avg_return", "eval_env_step").items() if split_method(k[0])[1] is None}
+    steps = {k: v for k, v in load(results_dir, "avg_return", "env_step").items() if split_method(k[0])[1] is None}
     times = {k: v for k, v in load(results_dir, "avg_return", time_key).items() if split_method(k[0])[1] is None}
     if methods is not None:
         steps = {k: v for k, v in steps.items() if k[0] in methods}
@@ -313,7 +352,10 @@ def plot_auc(rows: list[dict], time_label: str, out_path: str) -> None:
                 yk = len(methods) - 1 - k
                 ax.scatter(r[f"{key}_seeds"], [yk] * len(r[f"{key}_seeds"]), s=22, color=color, alpha=0.45, lw=0,
                            zorder=2)
-                ax.scatter([r[key]], [yk], s=70 * MARKER_SCALE.get(marker, 1) ** 2, color=color, marker=marker, edgecolors=SURFACE, linewidths=1.5,
+                hollow = is_asym(method)
+                ax.scatter([r[key]], [yk], s=70 * MARKER_SCALE.get(marker, 1) ** 2, marker=marker,
+                           facecolors=SURFACE if hollow else color, edgecolors=color if hollow else SURFACE,
+                           linewidths=1.8 if hollow else 1.5,
                            zorder=3)
                 pct = r[f"{key}_vs_baseline_pct"]
                 note = "" if method == "baseline" or not np.isfinite(pct) else f"  {pct:+.1f}%"
@@ -345,6 +387,112 @@ def plot_auc(rows: list[dict], time_label: str, out_path: str) -> None:
     print(f"saved {out_path}")
 
 
+PAPER_CSV = "results/stateRL_gpusim/FlashSAC.csv"
+
+
+def load_paper(path: str) -> dict[str, list[dict[str, np.ndarray]]]:
+    """The FlashSAC paper's eval-return curves, one per seed, keyed by short task name. The paper records each eval at
+    the next logging step (the 5.00M eval at 5.50M, ...), the same axis as the `env_step` column of our rows."""
+    by_seed: dict[tuple[str, str], list[tuple[float, float]]] = defaultdict(list)
+    for row in csv.DictReader(open(path)):
+        task = short_task(row["env_name"])
+        if row["metric"] == "avg_return" and task in TASK_ORDER:
+            by_seed[(task, row["seed"])].append((float(row["env_step"]) / 1e6, float(row["value"])))
+    curves: dict[str, list[dict[str, np.ndarray]]] = defaultdict(list)
+    for (task, _), points in sorted(by_seed.items()):
+        x, y = zip(*sorted(points))
+        curves[task].append({"x": np.array(x), "y": np.array(y)})
+    return curves
+
+
+def paper_comparison(ours: dict, paper: dict, method: str) -> list[dict]:
+    """Final return and normalized AUC of our `method` vs. the paper, per task, on the paper's step axis.
+    Same definitions as scripts/compare_baseline.py: final = last eval; AUC = trapezoid area / last step;
+    z = (ours - paper) / combined standard error of the two means."""
+
+    def stats(values: list[float]) -> tuple[float, float, int]:
+        return float(np.mean(values)), float(np.std(values, ddof=1)) if len(values) > 1 else 0.0, len(values)
+
+    rows = []
+    for task in TASK_ORDER:
+        if (method, task) not in ours or task not in paper:
+            continue
+        row: dict = {"task": task}
+        for who, runs in (("ours", ours[(method, task)]), ("paper", paper[task])):
+            row[f"{who}_final"], row[f"{who}_final_sd"], row[f"{who}_seeds"] = stats([r["y"][-1] for r in runs])
+            row[f"{who}_auc"], row[f"{who}_auc_sd"], _ = stats(
+                [mean_return_until(r["x"], r["y"], r["x"][-1]) for r in runs])
+        for k in ("final", "auc"):
+            diff = row[f"ours_{k}"] - row[f"paper_{k}"]
+            se = np.sqrt(row[f"ours_{k}_sd"] ** 2 / row["ours_seeds"] + row[f"paper_{k}_sd"] ** 2 / row["paper_seeds"])
+            row[f"{k}_diff"], row[f"{k}_diff_pct"] = diff, 100 * diff / row[f"paper_{k}"]
+            row[f"{k}_z"] = diff / se if se > 0 else float("nan")
+        rows.append(row)
+    return rows
+
+
+def write_paper_csv(rows: list[dict], out_path: str) -> None:
+    cols = ["task", "ours_seeds", "paper_seeds", "ours_final", "ours_final_sd", "paper_final", "paper_final_sd",
+            "final_diff", "final_diff_pct", "final_z", "ours_auc", "ours_auc_sd", "paper_auc", "paper_auc_sd",
+            "auc_diff", "auc_diff_pct", "auc_z"]
+    with open(out_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(cols)
+        for r in rows:
+            writer.writerow([r[c] if isinstance(r[c], (str, int)) else round(r[c], 4) for c in cols])
+    print(f"saved {out_path}")
+
+
+def plot_paper(rows: list[dict], ours: dict, paper: dict, method: str, out_path: str) -> None:
+    """Our `method` vs. the paper per task: mean curve with a min–max band over seeds, the paper as a dashed
+    reference line, and the differences in each panel title."""
+    color, marker = style(split_method(method)[0])
+    fig, axes = plt.subplots(2, 2, figsize=(12.4, 8.0), squeeze=False, facecolor=SURFACE)
+    for ax, row in zip(axes.flat, rows):
+        task = row["task"]
+        ax.set_facecolor(SURFACE)
+        ends = []
+        for runs, name, c, ls, mk in ((paper[task], f"Paper ({row['paper_seeds']} seeds)", TEXT_2, "--", None),
+                                      (ours[(method, task)], f"Ours, {label(method)} ({row['ours_seeds']} seeds)",
+                                       color, "-", marker)):
+            n = min(len(r["y"]) for r in runs)
+            x = np.mean([r["x"][:n] for r in runs], axis=0)
+            y = np.stack([r["y"][:n] for r in runs])
+            ax.plot(x, y.mean(0), color=c, lw=2, ls=ls, marker=mk, ms=5, mec=SURFACE, mew=1.2, label=name, zorder=3)
+            ax.fill_between(x, y.min(0), y.max(0), color=c, alpha=0.12, lw=0, zorder=2)
+            ends.append((x[-1], y.mean(0)[-1], name.split(" (")[0]))
+        ax.autoscale_view()
+        y_lo, y_hi = ax.get_ylim()
+        for (x_end, y_end, name), y_lab in zip(ends, spread_labels([e[1] for e in ends], 0.06 * (y_hi - y_lo))):
+            ax.annotate(f"{name} {y_end:.1f}", xy=(x_end, y_lab), xytext=(8, 0), textcoords="offset points",
+                        va="center", fontsize=8, color=TEXT_2, annotation_clip=False)
+        ax.set_title(task, color=TEXT, fontsize=11, loc="left", fontweight="bold", pad=20)
+        ax.text(0, 1.02, f"final {row['final_diff']:+.2f} ({row['final_diff_pct']:+.1f}%, z {row['final_z']:+.1f})   "
+                f"AUC {row['auc_diff']:+.2f} ({row['auc_diff_pct']:+.1f}%, z {row['auc_z']:+.1f})",
+                transform=ax.transAxes, fontsize=8.5, color=TEXT_2, va="bottom", ha="left")
+        ax.set_xlabel("Environment steps (millions), logging step as in the paper", color=TEXT_2, fontsize=9)
+        ax.set_ylabel("Eval return", color=TEXT_2, fontsize=9)
+        ax.grid(True, color=GRID, lw=0.8)
+        ax.set_axisbelow(True)
+        ax.tick_params(colors=TEXT_2, labelsize=8.5, length=0)
+        for side in ("top", "right"):
+            ax.spines[side].set_visible(False)
+        for side in ("left", "bottom"):
+            ax.spines[side].set_color(GRID)
+        ax.margins(x=0.02)
+    for ax in axes.flat[len(rows):]:
+        ax.set_visible(False)
+    handles, labels = axes.flat[0].get_legend_handles_labels()
+    fig.tight_layout(rect=(0, 0, 0.92, 0.88), h_pad=2.5)
+    fig.suptitle(f"Ours vs. the FlashSAC paper (mean, band = min–max over seeds; ours − paper above each panel)",
+                 color=TEXT, fontsize=12.5, x=0.01, ha="left", y=0.985, fontweight="bold")
+    fig.legend(handles, labels, loc="upper left", ncol=2, frameon=False, fontsize=9.5, labelcolor=TEXT,
+               bbox_to_anchor=(0.0, 0.955))
+    fig.savefig(out_path, dpi=160, bbox_inches="tight", facecolor=SURFACE)
+    plt.close(fig)
+    print(f"saved {out_path}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--results_dir", nargs="+", default=["results/nish"],
@@ -355,6 +503,8 @@ def main() -> None:
     parser.add_argument("--methods", nargs="+", default=None,
                         help="only plot these method directories, e.g. --methods crossq crossq_1q crossq_1q_w360")
     parser.add_argument("--suffix", default="", help="appended to the figure file names, e.g. _critic")
+    parser.add_argument("--paper_csv", default=PAPER_CSV, help="the FlashSAC paper's results, for paper_vs_<method>")
+    parser.add_argument("--paper_method", default="baseline", help="which of our methods to compare with the paper")
     args = parser.parse_args()
 
     out_dir = args.out_dir or os.path.join(args.results_dir[0], "plots")
@@ -365,7 +515,7 @@ def main() -> None:
 
     #          name                      y column              x column         y label / title / options
     figures = [
-        ("return_vs_steps", "avg_return", "eval_env_step", "Eval return", "Eval return vs. environment steps", {}),
+        ("return_vs_steps", "avg_return", "env_step", "Eval return", "Eval return vs. environment steps", {}),
         (f"return_vs_{args.time}_time", "avg_return", time_key, "Eval return", "Eval return vs. wall-clock time",
          {"x_label": time_label, "x_in_label": "min"}),
     ]
@@ -389,6 +539,15 @@ def main() -> None:
         budget_label = "wall-clock budget" if args.time == "wall" else "training-time budget"
         write_auc_csv(rows, os.path.join(out_dir, f"auc{args.suffix}.csv"))
         plot_auc(rows, budget_label, os.path.join(out_dir, f"auc{args.suffix}.png"))
+
+    # our baseline vs. the paper, on the paper's step axis (the logging step)
+    if os.path.exists(args.paper_csv) and (args.methods is None or args.paper_method in args.methods):
+        ours = load(args.results_dir, "avg_return", "env_step")
+        rows = paper_comparison(ours, load_paper(args.paper_csv), args.paper_method)
+        if rows:
+            name = f"paper_vs_{args.paper_method}{args.suffix}"
+            write_paper_csv(rows, os.path.join(out_dir, f"{name}.csv"))
+            plot_paper(rows, ours, load_paper(args.paper_csv), args.paper_method, os.path.join(out_dir, f"{name}.png"))
 
 
 if __name__ == "__main__":

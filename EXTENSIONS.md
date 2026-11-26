@@ -104,6 +104,40 @@ runs the four IsaacLab humanoid tasks for each seed; see the examples at the top
 
 Flags and overrides can be mixed in any order.
 
+## Runs comparable with Nish's (`results/nish`)
+
+- **Code:** branch `Nish`, commit `004b987` or later. No local edits; keep the output of `git log -1` with the results.
+- **Machine:** g6e.2xlarge (L40S), 200 GB disk. One run per GPU, inside tmux. Check the install with
+  `uv run python -m pytest tests/ -q`: 45 tests should pass.
+- **Launch only through `scripts/run_humanoid.sh`.** It sets everything else (50M steps, 1024 envs, batch 2048,
+  2 updates per step, 10M buffer, n-step 3, γ 0.99, AMP, d=2, compile cache off). Pass no other overrides.
+- **Seeds and tasks:** leave the defaults: seeds 0, 1000, 2000 and all 4 tasks.
+- **Commands** (`<exp>` names are the ones the plots know):
+
+      scripts/run_humanoid.sh baseline
+      scripts/run_humanoid.sh crossq               agent.critic_target=online
+      scripts/run_humanoid.sh crossq_1q            agent.critic_target=online agent.critic_num_qs=1
+      scripts/run_humanoid.sh crossq_1q_w360       agent.critic_target=online agent.critic_num_qs=1 agent.critic_hidden_dim=360
+      scripts/run_humanoid.sh crossq_asym          --asym agent.critic_target=online
+      scripts/run_humanoid.sh crossq_1q_asym       --asym agent.critic_target=online agent.critic_num_qs=1
+      scripts/run_humanoid.sh crossq_1q_w360_asym  --asym agent.critic_target=online agent.critic_num_qs=1 agent.critic_hidden_dim=360
+
+- **Smoke test first** (2M steps, ~8 min each): `scripts/run_smoke.sh smoke_crossq_asym smoke_1q_asym smoke_1q_w360_asym`.
+- **Memory with `--asym`:** the replay buffer doubles. Estimated (float32 observation + next observation, 10M
+  transitions): Flat-G1 ≈ 20 GB, Flat-H1 ≈ 11 GB, Rough-H1 ≈ 41 GB, Rough-G1 ≈ 50 GB. The L40S has 46 GB, so the rough
+  tasks need `agent.buffer_device_type=cpu`, and Rough-G1's buffer then needs more host RAM than a g6e.2xlarge's 64 GB
+  comfortably holds: run the rough `--asym` tasks on a g6e.4xlarge (same GPU, 128 GB RAM). Learning is unchanged;
+  wall-clock time is then not comparable with ours.
+- **Check the first run:** diff its `config.yaml` against ours for the same method without `_asym`, e.g.
+  `results/nish/crossq_1q_w360/Isaac-Velocity-Flat-G1-v0/seed1000_*/config.yaml`. Only `exp_name`, `seed`,
+  `save_path`, `env.privileged_critic`, `agent.asymmetric_observation` (and `agent.buffer_device_type`, if set) may
+  differ.
+- **Keep:** only complete runs (last `env_step` = 50000896), in `results/<name>/<method>/<task>/<run>/` (`metrics.csv`,
+  `config.yaml`), plus a full bundle in `results/<name>_full/` (logs, checkpoints, TensorBoard, console logs,
+  `git log -1`, `nvidia-smi`).
+- **Compare:** `python scripts/plot_results.py --results_dir results/<name> results/nish`. Returns and AUC compare
+  directly; for speed use `time/update_time` or runs from the same instance (instances differ by up to ~10%).
+
 ## Privileged critic (IsaacLab)
 
 IsaacLab adds noise to the policy observations (joint velocities ±1.5, base angular velocity ±0.2, height scan ±0.1,
