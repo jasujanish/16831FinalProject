@@ -1,4 +1,0 @@
-# raw run archives and unpacked logs are too large for git; they are shared on Drive
-*.tar.gz
-pilot/
-sweep/
