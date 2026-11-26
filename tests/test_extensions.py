@@ -7,6 +7,8 @@ in-batch surprise weighting, logging).
 
 import csv
 import os
+from dataclasses import dataclass, field
+from types import SimpleNamespace
 
 os.environ.setdefault("TORCH_COMPILE_DISABLE", "1")  # no compiler needed for the tests
 
@@ -60,7 +62,7 @@ def make_buffer(max_length: int, **kwargs) -> TorchUniformBuffer:
     )
 
 
-def make_agent(*overrides: str):
+def make_agent(*overrides: str, env_info=None):
     with hydra.initialize(version_base=None, config_path="../configs"):
         cfg = hydra.compose(
             "flashSAC_base",
@@ -76,7 +78,7 @@ def make_agent(*overrides: str):
             ],
         )
     OmegaConf.resolve(cfg)
-    agent = create_agent(OBS_SPACE, ACTION_SPACE, {}, cfg.agent)
+    agent = create_agent(OBS_SPACE, ACTION_SPACE, dict(env_info or {}), cfg.agent)
     for step in range(100):
         agent.process_transition(make_transition(step))
     return agent
@@ -460,3 +462,52 @@ def test_csv_logger(tmp_path, monkeypatch) -> None:
     assert [r["a"] for r in rows] == ["1.0", "2.0", "3.0", ""]
     assert [r["b"] for r in rows] == ["", "", "4.0", "5.0"]
     assert os.path.exists(os.path.join(logger.log_dir, "config.yaml"))
+
+
+def test_privileged_critic_group() -> None:
+    """The critic group is a noise-free copy of the policy group; the policy group is left untouched."""
+    from flash_rl.envs.isaaclab import add_privileged_critic_group  # imports no IsaacLab module at import time
+
+    @dataclass
+    class Term:
+        noise: object = "noise"
+
+    @dataclass
+    class Group:
+        enable_corruption: bool = True
+        concatenate_terms: bool = True
+        joint_vel: Term = field(default_factory=Term)
+        height_scan: object = None  # flat tasks remove this term
+
+    env_cfg = SimpleNamespace(observations=SimpleNamespace(policy=Group()))
+    add_privileged_critic_group(env_cfg)
+    policy, critic = env_cfg.observations.policy, env_cfg.observations.critic
+    assert policy.enable_corruption and not critic.enable_corruption
+    assert critic is not policy and critic.joint_vel is not policy.joint_vel
+    assert critic.height_scan is None and critic.concatenate_terms
+    with pytest.raises(ValueError):
+        add_privileged_critic_group(env_cfg)
+
+
+def test_asymmetric_actor_ignores_critic_observation() -> None:
+    """With asymmetric observations the actor uses only the first `actor_observation_size` entries."""
+    actor_dim = 3
+    agent = make_agent("agent.asymmetric_observation=true", env_info={"actor_observation_size": (actor_dim,)})
+    rng = np.random.default_rng(0)
+    obs = rng.normal(size=(NUM_ENVS, OBS_DIM)).astype(np.float32)
+    other = obs.copy()
+    other[:, actor_dim:] = rng.normal(size=(NUM_ENVS, OBS_DIM - actor_dim))
+    a1 = agent.sample_actions(0, {"next_observation": obs}, training=False)
+    a2 = agent.sample_actions(0, {"next_observation": other}, training=False)
+    np.testing.assert_allclose(a1, a2)
+    other[:, :actor_dim] += 1.0
+    a3 = agent.sample_actions(0, {"next_observation": other}, training=False)
+    assert not np.allclose(a1, a3)
+    infos = [agent.update() for _ in range(6)]
+    assert all(np.isfinite(v) for i in infos for v in i.values())
+
+
+def test_privileged_env_requires_asymmetric_agent() -> None:
+    """Without the asymmetric flag the actor would read the privileged observations: refuse to build the agent."""
+    with pytest.raises(ValueError, match="asymmetric_observation"):
+        make_agent(env_info={"actor_observation_size": (3,), "asymmetric_obs": True})
