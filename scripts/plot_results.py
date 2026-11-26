@@ -1,7 +1,8 @@
 """
 Plot learning curves and diagnostics from metrics.csv files.
 
-usage: python scripts/plot_results.py [--results_dir results/nish] [--out_dir results/nish/plots] [--time wall|train]
+usage: python scripts/plot_results.py [--results_dir results/nish [more dirs]] [--out_dir results/nish/plots]
+                                      [--time wall|train]
                                       [--methods crossq crossq_1q ...] [--suffix _critic]
 
 Expects <results_dir>/<method>/<task>/<run>/metrics.csv (the layout of logs/<group>/). Writes two figures per actor
@@ -9,6 +10,14 @@ delay, each with one panel per task and one line per method:
 
     return_vs_steps_d<k>.png       eval return vs. environment steps
     return_vs_<time>_time_d<k>.png eval return vs. wall-clock time (or training time with --time train)
+
+plus, for the d=2 methods, the normalized area under the return curve (auc.png and auc.csv): the mean return over
+0-50M steps, and the mean return over a common time budget per task (the shortest final time of any run on it).
+The wall-clock figure labels each line "<method> (<final return>, <mean final time> min)".
+
+Rafay's runs, compared with our baseline:
+    python scripts/plot_results.py --results_dir results/rafay results/nish \
+        --methods baseline architecture_linear_bottleneck architecture_swiglu --out_dir results/rafay/plots
 
 A method directory named <method>_d<k> (e.g. baseline_d4) holds runs with actor delay k and goes into the _d<k>
 figures; a plain <method> directory is FlashSAC's default delay, d=2. A method has the same color and marker in every
@@ -33,7 +42,8 @@ import numpy as np  # noqa: E402
 
 # Fixed color and marker per base method, so a method looks the same in every figure. Colors are categorical slots
 # 1-8 (light mode, CVD-validated in this order); markers keep methods apart where color alone is not enough.
-METHOD_ORDER = ["baseline", "minto", "crossq", "laber", "crossq_1q", "crossq_1q_w360", "crossq_sw", "crossq_1q_w360_sw"]
+METHOD_ORDER = ["baseline", "minto", "crossq", "laber", "crossq_1q", "crossq_1q_w360", "crossq_sw", "crossq_1q_w360_sw",
+                "architecture_linear_bottleneck", "architecture_swiglu"]
 LABELS = {
     "baseline": "Baseline",
     "minto": "MINTO",
@@ -43,9 +53,23 @@ LABELS = {
     "crossq_1q_w360": "Online, 1 wide critic",
     "crossq_sw": "Online + surprise wt.",
     "crossq_1q_w360_sw": "Online, 1 wide critic + surprise wt.",
+    "architecture_linear_bottleneck": "Linear bottleneck",
+    "architecture_swiglu": "SwiGLU",
 }
 COLORS = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#6250d6", "#e34948"]
 MARKERS = ["o", "s", "^", "D", "v", "P", "X", "*"]
+MARKER_SCALE = {"*": 1.8}  # the star draws much smaller than the other markers at the same size
+# There are 8 color slots and more methods, so Rafay's two block architectures reuse the slots of two archived methods
+# (laber, crossq_1q_w360_sw; now in results/nish/old_runs) that are never drawn in the same figure as them.
+# Baseline + linear bottleneck + SwiGLU (slots 1, 4, 8) passes the colorblind-safety validator.
+SLOTS = {m: i for i, m in enumerate(METHOD_ORDER[:8])} | {"architecture_linear_bottleneck": 3, "architecture_swiglu": 7}
+
+
+def style(base: str) -> tuple[str, str]:
+    """(color, marker) of a base method: its fixed slot, or the next free slot for a method not listed above."""
+    if base not in SLOTS:
+        SLOTS[base] = len(SLOTS) % len(COLORS)
+    return COLORS[SLOTS[base]], MARKERS[SLOTS[base] % len(MARKERS)]
 TASK_ORDER = ["Flat-G1", "Rough-G1", "Flat-H1", "Rough-H1"]
 
 SURFACE, TEXT, TEXT_2, GRID = "#fcfcfb", "#0b0b0b", "#52514e", "#e4e3df"
@@ -84,9 +108,10 @@ def read_series(path: str, y_key: str, x_key: str) -> Optional[dict[str, np.ndar
     return {"x": np.array(xs), "y": np.array(ys)} if len(ys) > 1 else None
 
 
-def load(results_dir: str, y_key: str, x_key: str) -> dict[tuple[str, str], list[dict[str, np.ndarray]]]:
+def load(results_dirs: list[str], y_key: str, x_key: str) -> dict[tuple[str, str], list[dict[str, np.ndarray]]]:
     runs: dict[tuple[str, str], list[dict[str, np.ndarray]]] = defaultdict(list)
-    for path in glob.glob(os.path.join(results_dir, "*", "*", "*", "metrics.csv")):
+    paths = [p for d in results_dirs for p in glob.glob(os.path.join(d, "*", "*", "*", "metrics.csv"))]
+    for path in paths:
         method, task = path.split(os.sep)[-4], short_task(path.split(os.sep)[-3])
         series = read_series(path, y_key, x_key)
         if series is not None:
@@ -129,14 +154,14 @@ def spread_labels(ys: list[float], min_gap: float) -> list[float]:
 
 
 def plot(
-    runs, x_label: str, y_label: str, title: str, out_path: str, log_y: bool = False, note: str = ""
+    runs, x_label: str, y_label: str, title: str, out_path: str, log_y: bool = False, note: str = "",
+    x_in_label: str = "",
 ) -> None:
+    """x_in_label: if set (a unit, e.g. 'min'), each end-of-line label also shows the mean final x of that method."""
     methods = sorted({m for m, _ in runs}, key=method_sort_key)
     tasks = [t for t in TASK_ORDER if any(t == k[1] for k in runs)] + sorted({t for _, t in runs} - set(TASK_ORDER))
     # a method's color comes from its fixed slot, not from which methods happen to be in this figure
-    extra = sorted({split_method(m)[0] for m in methods} - set(METHOD_ORDER))
-    slots = {b: i for i, b in enumerate(METHOD_ORDER + extra)}
-    base_style = {b: (COLORS[i % len(COLORS)], MARKERS[i % len(MARKERS)]) for b, i in slots.items()}
+    base_style = {b: style(b) for b in sorted({split_method(m)[0] for m in methods}, key=method_sort_key)}
 
     ncols = 2 if len(tasks) > 1 else 1
     nrows = int(np.ceil(len(tasks) / ncols))
@@ -156,7 +181,7 @@ def plot(
             y = np.stack([r["y"] for r in rs])
             mean = y.mean(0)
             every = max(1, len(x) // 10)  # about 10 markers per line, also for the dense training metrics
-            ax.plot(x, mean, color=color, lw=2, marker=marker, ms=5, markevery=every, mec=SURFACE, mew=1.2,
+            ax.plot(x, mean, color=color, lw=2, marker=marker, ms=5 * MARKER_SCALE.get(marker, 1), markevery=every, mec=SURFACE, mew=1.2,
                     label=label(method), zorder=3)
             if len(rs) > 1:
                 ax.fill_between(x, y.min(0), y.max(0), color=color, alpha=0.15, lw=0, zorder=2)
@@ -173,9 +198,10 @@ def plot(
             span = to_axis(y_hi) - to_axis(y_lo)
             label_ys = spread_labels([to_axis(e[1]) for e in ends], min_gap=0.055 * span)
             x_end = max(e[0] for e in ends)
-            for (_, y_end, method), y_lab in zip(ends, label_ys):
+            for (x_last, y_end, method), y_lab in zip(ends, label_ys):
                 value = f"{y_end:.3g}" if log_y else f"{y_end:.2f}" if abs(y_end) < 10 else f"{y_end:.1f}"
-                ax.annotate(f"{label(method)} {value}", xy=(x_end, from_axis(y_lab)), xytext=(8, 0),
+                text = f"{label(method)} ({value}, {x_last:.1f} {x_in_label})" if x_in_label else f"{label(method)} {value}"
+                ax.annotate(text, xy=(x_end, from_axis(y_lab)), xytext=(8, 0),
                             textcoords="offset points", va="center", fontsize=8, color=TEXT_2,
                             annotation_clip=False)
 
@@ -213,10 +239,117 @@ def plot(
     print(f"saved {out_path}")
 
 
+def mean_return_until(x: np.ndarray, y: np.ndarray, budget: float) -> float:
+    """Mean of the return curve over [0, budget] (trapezoid rule), interpolating the curve at the budget."""
+    keep = x < budget
+    xs = np.append(x[keep], budget)
+    ys = np.append(y[keep], np.interp(budget, x, y))
+    trapezoid = getattr(np, "trapezoid", None) or np.trapz  # numpy < 2.0 only has trapz
+    return float(trapezoid(ys, xs) / budget)
+
+
+def auc_table(results_dir: list[str], time_key: str, methods: Optional[list[str]]) -> list[dict]:
+    """Normalized area under the eval-return curve per method and task, two ways:
+
+    steps: mean return over [0, final step]. Same definition as scripts/compare_baseline.py.
+    time:  mean return over [0, T], with T the shortest final time of any run of that task, so every method gets the
+           same time budget and no curve is extrapolated.
+    """
+    steps = {k: v for k, v in load(results_dir, "avg_return", "eval_env_step").items() if split_method(k[0])[1] is None}
+    times = {k: v for k, v in load(results_dir, "avg_return", time_key).items() if split_method(k[0])[1] is None}
+    if methods is not None:
+        steps = {k: v for k, v in steps.items() if k[0] in methods}
+        times = {k: v for k, v in times.items() if k[0] in methods}
+    rows = []
+    for task in sorted({t for _, t in steps}, key=lambda t: TASK_ORDER.index(t) if t in TASK_ORDER else 99):
+        budget = min(r["x"][-1] for (m, t), rs in times.items() if t == task for r in rs)
+        for method in sorted({m for m, t in steps if t == task}, key=method_sort_key):
+            s = [mean_return_until(r["x"], r["y"], r["x"][-1]) for r in steps[(method, task)]]
+            w = [mean_return_until(r["x"], r["y"], budget) for r in times[(method, task)]]
+            rows.append({"method": method, "task": task, "seeds": len(s),
+                         "auc_steps": float(np.mean(s)), "auc_steps_sd": float(np.std(s, ddof=1)) if len(s) > 1 else 0.0,
+                         "auc_steps_seeds": s, "auc_time": float(np.mean(w)),
+                         "auc_time_sd": float(np.std(w, ddof=1)) if len(w) > 1 else 0.0, "auc_time_seeds": w,
+                         "time_budget_min": budget})
+    for row in rows:  # change relative to the baseline on the same task
+        base = next((b for b in rows if b["task"] == row["task"] and b["method"] == "baseline"), None)
+        for k in ("auc_steps", "auc_time"):
+            row[f"{k}_vs_baseline_pct"] = 100 * (row[k] / base[k] - 1) if base else float("nan")
+    return rows
+
+
+def write_auc_csv(rows: list[dict], out_path: str) -> None:
+    cols = ["method", "task", "seeds", "auc_steps", "auc_steps_sd", "auc_steps_vs_baseline_pct", "auc_time",
+            "auc_time_sd", "auc_time_vs_baseline_pct", "time_budget_min"]
+    with open(out_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(cols + ["auc_steps_per_seed", "auc_time_per_seed"])
+        for r in rows:
+            writer.writerow([r[c] if isinstance(r[c], str) else round(r[c], 4) for c in cols]
+                            + [" ".join(f"{v:.3f}" for v in r["auc_steps_seeds"]),
+                               " ".join(f"{v:.3f}" for v in r["auc_time_seeds"])])
+    print(f"saved {out_path}")
+
+
+def plot_auc(rows: list[dict], time_label: str, out_path: str) -> None:
+    """Dot plot: one panel per (AUC kind, task); a row per method with its seeds (small dots) and mean (large marker).
+    Dots, not bars: the differences are a few percent of the value, which bars from zero would hide."""
+    tasks = [t for t in TASK_ORDER if any(r["task"] == t for r in rows)]
+    methods = sorted({r["method"] for r in rows}, key=method_sort_key)
+    kinds = [("auc_steps", "Mean return over 0–50M steps"), ("auc_time", f"Mean return over a common {time_label}")]
+
+    fig, axes = plt.subplots(len(kinds), len(tasks), figsize=(3.6 * len(tasks), 0.42 * len(methods) * 2 + 2.6),
+                             squeeze=False, facecolor=SURFACE)
+    for i, (key, kind_title) in enumerate(kinds):
+        for j, task in enumerate(tasks):
+            ax = axes[i, j]
+            ax.set_facecolor(SURFACE)
+            task_rows = {r["method"]: r for r in rows if r["task"] == task}
+            for k, method in enumerate(methods):
+                r = task_rows.get(method)
+                if r is None:
+                    continue
+                color, marker = style(split_method(method)[0])
+                yk = len(methods) - 1 - k
+                ax.scatter(r[f"{key}_seeds"], [yk] * len(r[f"{key}_seeds"]), s=22, color=color, alpha=0.45, lw=0,
+                           zorder=2)
+                ax.scatter([r[key]], [yk], s=70 * MARKER_SCALE.get(marker, 1) ** 2, color=color, marker=marker, edgecolors=SURFACE, linewidths=1.5,
+                           zorder=3)
+                pct = r[f"{key}_vs_baseline_pct"]
+                note = "" if method == "baseline" or not np.isfinite(pct) else f"  {pct:+.1f}%"
+                ax.annotate(f"{r[key]:.1f}{note}", xy=(r[key], yk), xytext=(0, 9), textcoords="offset points",
+                            ha="center", fontsize=8, color=TEXT_2)
+            ax.set_yticks(range(len(methods)))
+            ax.set_yticklabels([label(m) for m in reversed(methods)] if j == 0 else [], fontsize=8.5, color=TEXT)
+            ax.set_ylim(-0.6, len(methods) - 0.3)
+            budget = next(r["time_budget_min"] for r in rows if r["task"] == task)
+            ax.set_title(task + (f"  (first {budget:.0f} min)" if key == "auc_time" else ""), color=TEXT,
+                         fontsize=10.5, loc="left", fontweight="bold")
+            if j == 0:
+                ax.text(0, 1.22, kind_title, transform=ax.transAxes, fontsize=10, color=TEXT_2, va="bottom")
+            ax.grid(True, axis="x", color=GRID, lw=0.8)
+            ax.set_axisbelow(True)
+            ax.tick_params(colors=TEXT_2, labelsize=8, length=0)
+            for side in ("top", "right", "left"):
+                ax.spines[side].set_visible(False)
+            ax.spines["bottom"].set_color(GRID)
+            lo, hi = ax.get_xlim()
+            ax.set_xlim(lo - 0.08 * (hi - lo), hi + 0.08 * (hi - lo))
+    seeds = sorted({r["seeds"] for r in rows})
+    fig.suptitle(f"Area under the eval-return curve (large marker = mean of {'/'.join(map(str, seeds))} seeds, "
+                 f"small dots = seeds; % vs. baseline)", color=TEXT, fontsize=12, x=0.01, ha="left",
+                 fontweight="bold")
+    fig.tight_layout(rect=(0, 0, 1, 0.95), h_pad=3.0)
+    fig.savefig(out_path, dpi=160, bbox_inches="tight", facecolor=SURFACE)
+    plt.close(fig)
+    print(f"saved {out_path}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--results_dir", default="results/nish")
-    parser.add_argument("--out_dir", default=None, help="default: <results_dir>/plots")
+    parser.add_argument("--results_dir", nargs="+", default=["results/nish"],
+                        help="one or more folders; e.g. results/rafay results/nish to compare against our baseline")
+    parser.add_argument("--out_dir", default=None, help="default: <first results_dir>/plots")
     parser.add_argument("--time", choices=["wall", "train"], default="wall",
                         help="wall: elapsed time including evaluation; train: training time only (eval excluded)")
     parser.add_argument("--methods", nargs="+", default=None,
@@ -224,7 +357,7 @@ def main() -> None:
     parser.add_argument("--suffix", default="", help="appended to the figure file names, e.g. _critic")
     args = parser.parse_args()
 
-    out_dir = args.out_dir or os.path.join(args.results_dir, "plots")
+    out_dir = args.out_dir or os.path.join(args.results_dir[0], "plots")
     os.makedirs(out_dir, exist_ok=True)
     time_key = "wall_time" if args.time == "wall" else "eval_train_time"
     time_label = "Wall-clock time (minutes)" if args.time == "wall" else "Training time, excl. evaluation (minutes)"
@@ -234,7 +367,7 @@ def main() -> None:
     figures = [
         ("return_vs_steps", "avg_return", "eval_env_step", "Eval return", "Eval return vs. environment steps", {}),
         (f"return_vs_{args.time}_time", "avg_return", time_key, "Eval return", "Eval return vs. wall-clock time",
-         {"x_label": time_label}),
+         {"x_label": time_label, "x_in_label": "min"}),
     ]
     found = False
     for name, y_key, x_key, y_label, title, opts in figures:
@@ -245,10 +378,17 @@ def main() -> None:
         for delay, runs in sorted(by_delay(loaded).items()):
             found = True
             out_path = os.path.join(out_dir, f"{name}_d{delay}{args.suffix}.png")
-            plot(runs, opts.get("x_label", steps), y_label, title, out_path,
+            plot(runs, opts.get("x_label", steps), y_label, title, out_path, x_in_label=opts.get("x_in_label", ""),
                  log_y=opts.get("log_y", False), note=f"d={delay}" + (f"; {opts['note']}" if "note" in opts else ""))
     if not found:
-        raise SystemExit(f"no metrics.csv found under {args.results_dir}/<method>/<task>/<run>/")
+        raise SystemExit(f"no metrics.csv found under {' '.join(args.results_dir)} (<dir>/<method>/<task>/<run>/)")
+
+    # area under the curve, for the d=2 methods (vs. steps and vs. a common time budget per task)
+    rows = auc_table(args.results_dir, time_key, args.methods)
+    if rows:
+        budget_label = "wall-clock budget" if args.time == "wall" else "training-time budget"
+        write_auc_csv(rows, os.path.join(out_dir, f"auc{args.suffix}.csv"))
+        plot_auc(rows, budget_label, os.path.join(out_dir, f"auc{args.suffix}.png"))
 
 
 if __name__ == "__main__":
