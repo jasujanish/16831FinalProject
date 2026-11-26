@@ -146,7 +146,10 @@ off (`add_privileged_critic_group` in `flash_rl/envs/isaaclab.py`). The env then
 with `agent.asymmetric_observation=true` the actor reads only the first (noisy) part and the critic reads both, so the
 trained policy takes the same inputs as before.
 
-    scripts/run_humanoid.sh privcritic --asym     # = env.privileged_critic=true agent.asymmetric_observation=true
+    scripts/run_humanoid.sh baseline_asym --asym
+
+`baseline_asym` is only the experiment name (the log folder and the label in the plots); `--asym` is what turns the
+privileged critic on, and equals `env.privileged_critic=true agent.asymmetric_observation=true`.
 
 - Set both keys. The agent refuses to start with `env.privileged_critic=true` alone, because the actor would then be
   trained on the noise-free observations.
