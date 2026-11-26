@@ -7,6 +7,7 @@
 #   scripts/run_smoke.sh
 #   scripts/run_smoke.sh smoke_minto smoke_crossq
 #   scripts/run_smoke.sh smoke_1q smoke_1q_w360 smoke_sw smoke_1q_w360_sw     # critic runs 1-4
+#   scripts/run_smoke.sh smoke_crossq_asym smoke_1q_asym smoke_1q_w360_asym   # asymmetric-critic runs
 #
 # Console output of each run is also written to ~/<exp_name>.log.
 ##################################################################################
@@ -24,6 +25,10 @@ declare -A overrides=(
     [smoke_1q_w360]="agent.critic_target=online agent.critic_num_qs=1 agent.critic_hidden_dim=360"
     [smoke_sw]="agent.critic_target=online agent.critic_surprise_weight_alpha=0.5"
     [smoke_1q_w360_sw]="agent.critic_target=online agent.critic_num_qs=1 agent.critic_hidden_dim=360 agent.critic_surprise_weight_alpha=0.5"
+    # asymmetric-critic runs (not in the default list; pass them by name)
+    [smoke_crossq_asym]="--asym agent.critic_target=online"
+    [smoke_1q_asym]="--asym agent.critic_target=online agent.critic_num_qs=1"
+    [smoke_1q_w360_asym]="--asym agent.critic_target=online agent.critic_num_qs=1 agent.critic_hidden_dim=360"
 )
 
 exps=("$@")

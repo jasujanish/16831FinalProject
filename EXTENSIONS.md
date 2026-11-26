@@ -23,6 +23,8 @@ All keys live in `configs/agent/flashSAC.yaml` and are set with `--overrides age
 | `critic_num_qs` | `2` | Critics in the ensemble. `1` = a single critic, no clipped double Q |
 | `critic_surprise_weight_alpha` | `0.0` | In-batch surprise weighting of the critic loss (`0` = off) |
 | `critic_surprise_weight_min` / `_max` | `0.5` / `3.0` | Clip range of the surprise weights |
+| `block_type` | `relu`, `linear_bottleneck`, `swiglu` | Residual block of the actor and critic (Rafay's arch variants): FlashSAC's 4× ReLU block; 2× expansion without the ReLU after the block; gated SiLU with ≈ the same parameters |
+| `asymmetric_observation` | `false`, `true` | The critic also reads the env's privileged observations (use with `env.privileged_critic=true`) |
 
 `log_csv` (default `true`, in `configs/flashSAC_base.yaml`) turns the CSV log on or off.
 
@@ -93,9 +95,14 @@ the `target` results (the two networks share no state).
 
 ## Running
 
-    scripts/run_humanoid.sh <exp_name> [agent overrides...]
+    scripts/run_humanoid.sh <exp_name> [--asym] [--block relu|linear_bottleneck|swiglu] [overrides...]
 
 runs the four IsaacLab humanoid tasks for each seed; see the examples at the top of the script.
+
+- `--asym`: asymmetric (privileged) critic, i.e. `env.privileged_critic=true agent.asymmetric_observation=true`.
+- `--block B`: `agent.block_type=B` for the actor and critic.
+
+Flags and overrides can be mixed in any order.
 
 ## Privileged critic (IsaacLab)
 
@@ -105,7 +112,7 @@ off (`add_privileged_critic_group` in `flash_rl/envs/isaaclab.py`). The env then
 with `agent.asymmetric_observation=true` the actor reads only the first (noisy) part and the critic reads both, so the
 trained policy takes the same inputs as before.
 
-    scripts/run_humanoid.sh privcritic env.privileged_critic=true agent.asymmetric_observation=true
+    scripts/run_humanoid.sh privcritic --asym     # = env.privileged_critic=true agent.asymmetric_observation=true
 
 - Set both keys. The agent refuses to start with `env.privileged_critic=true` alone, because the actor would then be
   trained on the noise-free observations.

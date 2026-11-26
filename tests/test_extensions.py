@@ -511,3 +511,25 @@ def test_privileged_env_requires_asymmetric_agent() -> None:
     """Without the asymmetric flag the actor would read the privileged observations: refuse to build the agent."""
     with pytest.raises(ValueError, match="asymmetric_observation"):
         make_agent(env_info={"actor_observation_size": (3,), "asymmetric_obs": True})
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        # the three asymmetric group-plan runs: Online, 1 critic, 1 wide critic, each with the asymmetric critic
+        ("agent.critic_target=online",),
+        ("agent.critic_target=online", "agent.critic_num_qs=1"),
+        ("agent.critic_target=online", "agent.critic_num_qs=1", "agent.critic_hidden_dim=360"),
+        # Rafay's block architectures on top of the single wide critic
+        ("agent.critic_target=online", "agent.critic_num_qs=1", "agent.block_type=swiglu"),
+        ("agent.critic_target=target", "agent.block_type=linear_bottleneck"),
+    ],
+)
+def test_merged_options_combine(overrides: tuple[str, ...]) -> None:
+    """Asymmetric critic (privileged-critic), block types (arch-variants) and the Online / single-critic options
+    (Nish) build and update together."""
+    actor_dim = 3
+    agent = make_agent("agent.asymmetric_observation=true", *overrides,
+                       env_info={"actor_observation_size": (actor_dim,), "asymmetric_obs": True})
+    infos = [agent.update() for _ in range(6)]
+    assert all(np.isfinite(v) for i in infos for v in i.values())
