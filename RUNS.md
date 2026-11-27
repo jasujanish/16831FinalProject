@@ -24,10 +24,12 @@ Note: architectural changes were not impressive enough
 - [ ] Online + 1 wide 4 critic (4x the trainable params of the wide critic, same depth) + asymmetric critic
 
 ## Note on Timing
-- Running on Shiyu's local lab setup does not give an exactly fair time comparison to running on AWS
-- For the additional ablations, we can just make steps vs td error or steps vs performance, so we can use the results from the local lab setup without issue
+- We graph multiple time-based statistics. These stats are influeneced by the hardware that we run on.
+- Running on Shiyu's local lab setup does not give an exactly fair time comparison to running on AWS.
+- For the main runs, we probably should graph time-based stats. For the additional ablations, we can just graph step-based states (ex: return vs steps, critic performance vs steps), so we can use the results from the local lab setup without issue.
 
 ## Extras (Not 100% necessary, can be cut if we're short on compute)
-- [ ] Online + asymmetric critic (not absolutely necessary, less important than additional ablations, can be cut if need be)
-- [ ] 1 critic + asymmetric critic (not absolutely necessary, less important than additional ablations, can be cut if need be)
-- [ ] 1 wide critic + asymmetric critic (not absolutely necessary, less important than additional ablations, can be cut if need be)
+- These runs are not absolutely necessary, less important than additional ablations, and can be cut if need be
+- [ ] Online + asymmetric critic 
+- [ ] 1 critic + asymmetric critic
+- [ ] 1 wide critic + asymmetric critic
