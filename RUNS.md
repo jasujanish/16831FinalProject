@@ -9,11 +9,11 @@ Note: architectural changes were not impressive enough
 - [x] Online
 - [ ] 1 critic
 - [ ] 1 wide critic
-- [ ] asymmetric critic (done by Shiyu, I believe)
+- [ ] asymmetric critic
 - [x] Online + 1 critic
 - [x] Online + 1 wide critic
-- [x] Online + 1 critic + asymmetric critic (note: g6e.2x large runs are currently running, g6e.4xlarge runs are not done yet, will be done soon)
-- [x] Online + 1 wide critic + asymmetric critic (note: g6e.2x large runs are currently running, g6e.4xlarge runs are not done yet, will be done soon)
+- [x] Online + 1 critic + asymmetric critic (note: g6e.4xlarge runs (rough tasks) are currently running, will be done ~2 am EST 11/28. g6e.2x large runs (flat tasks) are partially done (3 of 6), the rest still need to be run)
+- [x] Online + 1 wide critic + asymmetric critic (note: g6e.4xlarge runs (rough tasks) are currently running, will be done ~2 am EST 11/28. g6e.2x large runs (flat tasks) have not been run yet)
 
 ## Additional Ablations
 - We make 12 main runs to understand the importance of each of the features

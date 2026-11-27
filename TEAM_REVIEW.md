@@ -154,3 +154,7 @@
 28. Z. Li et al. "Parallel Q-Learning: Scaling Off-policy Reinforcement Learning under Massively Parallel Simulation" (PQL). ICML 2023. arXiv:2307.12983. https://arxiv.org/abs/2307.12983
 29. K. Ota, D. K. Jha, A. Kanezaki. "Training Larger Networks for Deep Reinforcement Learning." arXiv:2102.07920, 2021. https://arxiv.org/abs/2102.07920
 30. H. Lee et al. "SimBa: Simplicity Bias for Scaling Up Parameters in Deep Reinforcement Learning." ICLR 2025. arXiv:2410.09754. https://arxiv.org/abs/2410.09754
+
+## Limitations 
+1. We are limited in the number of ablations + ideas we can explore due to a lack of compute
+2. We fail to examine sim-to-real transfer + real world performance due to a lack of a physical robot
