@@ -97,46 +97,13 @@ the `target` results (the two networks share no state).
 
     scripts/run_humanoid.sh <exp_name> [--asym] [--block relu|linear_bottleneck|swiglu] [overrides...]
 
-runs the four IsaacLab humanoid tasks for each seed; see the examples at the top of the script.
+runs the four IsaacLab humanoid tasks for each seed; see the examples at the top of the script. `--block B` sets
+`agent.block_type=B` for the actor and critic. Flags and overrides can be mixed in any order.
 
-- `--asym`: asymmetric (privileged) critic, i.e. `env.privileged_critic=true agent.asymmetric_observation=true`.
-- `--block B`: `agent.block_type=B` for the actor and critic.
-
-Flags and overrides can be mixed in any order.
-
-## Runs comparable with Nish's (`results/nish`)
-
-- **Code:** branch `Nish`, commit `004b987` or later. No local edits; keep the output of `git log -1` with the results.
-- **Machine:** g6e.2xlarge (L40S), 200 GB disk. One run per GPU, inside tmux. Check the install with
-  `uv run python -m pytest tests/ -q`: 45 tests should pass.
-- **Launch only through `scripts/run_humanoid.sh`.** It sets everything else (50M steps, 1024 envs, batch 2048,
-  2 updates per step, 10M buffer, n-step 3, γ 0.99, AMP, d=2, compile cache off). Pass no other overrides.
-- **Seeds and tasks:** leave the defaults: seeds 0, 1000, 2000 and all 4 tasks.
-- **Commands** (`<exp>` names are the ones the plots know):
-
-      scripts/run_humanoid.sh baseline
-      scripts/run_humanoid.sh crossq               agent.critic_target=online
-      scripts/run_humanoid.sh crossq_1q            agent.critic_target=online agent.critic_num_qs=1
-      scripts/run_humanoid.sh crossq_1q_w360       agent.critic_target=online agent.critic_num_qs=1 agent.critic_hidden_dim=360
-      scripts/run_humanoid.sh crossq_asym          --asym agent.critic_target=online
-      scripts/run_humanoid.sh crossq_1q_asym       --asym agent.critic_target=online agent.critic_num_qs=1
-      scripts/run_humanoid.sh crossq_1q_w360_asym  --asym agent.critic_target=online agent.critic_num_qs=1 agent.critic_hidden_dim=360
-
-- **Smoke test first** (2M steps, ~8 min each): `scripts/run_smoke.sh smoke_crossq_asym smoke_1q_asym smoke_1q_w360_asym`.
-- **Memory with `--asym`:** the replay buffer doubles. Estimated (float32 observation + next observation, 10M
-  transitions): Flat-G1 ≈ 20 GB, Flat-H1 ≈ 11 GB, Rough-H1 ≈ 41 GB, Rough-G1 ≈ 50 GB. The L40S has 46 GB, so the rough
-  tasks need `agent.buffer_device_type=cpu`, and Rough-G1's buffer then needs more host RAM than a g6e.2xlarge's 64 GB
-  comfortably holds: run the rough `--asym` tasks on a g6e.4xlarge (same GPU, 128 GB RAM). Learning is unchanged;
-  wall-clock time is then not comparable with ours.
-- **Check the first run:** diff its `config.yaml` against ours for the same method without `_asym`, e.g.
-  `results/nish/crossq_1q_w360/Isaac-Velocity-Flat-G1-v0/seed1000_*/config.yaml`. Only `exp_name`, `seed`,
-  `save_path`, `env.privileged_critic`, `agent.asymmetric_observation` (and `agent.buffer_device_type`, if set) may
-  differ.
-- **Keep:** only complete runs (last `env_step` = 50000896), in `results/<name>/<method>/<task>/<run>/` (`metrics.csv`,
-  `config.yaml`), plus a full bundle in `results/<name>_full/` (logs, checkpoints, TensorBoard, console logs,
-  `git log -1`, `nvidia-smi`).
-- **Compare:** `python scripts/plot_results.py --results_dir results/<name> results/nish`. Returns and AUC compare
-  directly; for speed use `time/update_time` or runs from the same instance (instances differ by up to ~10%).
+To make runs comparable with ours (machine, setup, exact commands, memory, smoke tests, what to send
+back, plotting), follow `STEPS.md`. One check it does not cover: diff the first run's `config.yaml` against the
+`results/nish` run of the same method without `_asym`. Only `exp_name`, `seed`, `save_path`, `env.privileged_critic`,
+`agent.asymmetric_observation` (and `agent.buffer_device_type`, if set) may differ.
 
 ## Privileged critic (IsaacLab)
 
@@ -146,15 +113,10 @@ off (`add_privileged_critic_group` in `flash_rl/envs/isaaclab.py`). The env then
 with `agent.asymmetric_observation=true` the actor reads only the first (noisy) part and the critic reads both, so the
 trained policy takes the same inputs as before.
 
-    scripts/run_humanoid.sh baseline_asym --asym
+`--asym` sets both keys (see `STEPS.md` for the commands and the memory each task needs).
 
-`baseline_asym` is only the experiment name (the log folder and the label in the plots); `--asym` is what turns the
-privileged critic on, and equals `env.privileged_critic=true agent.asymmetric_observation=true`.
-
-- Set both keys. The agent refuses to start with `env.privileged_critic=true` alone, because the actor would then be
+- The agent refuses to start with `env.privileged_critic=true` alone, because the actor would then be
   trained on the noise-free observations.
-- The stored observation doubles in size (Rough-H1: 256 → 512), and so does the replay buffer: about 41 GB for
-  Rough-H1 with 10M transitions. Add `agent.buffer_device_type=cpu` when it does not fit on the GPU.
 - `play_isaaclab.py` needs the same two overrides to load a checkpoint trained this way.
 - Before this change `agent.asymmetric_observation=true` had no effect on IsaacLab tasks: the check for a `critic`
   group was always false, and the combined observation shape was built by concatenating two shape tuples.
@@ -216,8 +178,6 @@ the Isaac Sim viewport as before.
 
 ## Tests
 
-    python -m pytest tests/test_extensions.py
-
-CPU-only; covers the SWD sampling distribution, ages, the delay rules, LaBER weights, the LR schedule, the critic
-target options and the CSV log. The tests disable `torch.compile`, so run a short GPU job per `critic_target` option
+The test command is in `STEPS.md` (step 2). `tests/test_extensions.py` is CPU-only; it covers the SWD sampling
+distribution, ages, the delay rules, LaBER weights, the LR schedule, the critic target options and the CSV log. The tests disable `torch.compile`, so run a short GPU job per `critic_target` option
 before a sweep.

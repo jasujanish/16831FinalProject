@@ -15,6 +15,20 @@ plus, for the d=2 methods, the normalized area under the return curve (auc.png a
 0-50M steps, and the mean return over a common time budget per task (the shortest final time of any run on it).
 The wall-clock figure labels each line "<method> (<final return>, <mean final time> min)".
 
+Diagnostics (d=2 methods):
+
+    update_time.png           minutes spent in gradient updates per run (time/update_time), seeds as dots, % vs. baseline
+    time_breakdown.png        where each method's wall-clock goes: env interaction, updates, evaluation, other
+    critic_td_error_d<k>.png  critic TD error |E[Q] - E[target]| (critic/td_abs) vs. steps, log scale
+    critic_td_ratio.png       the same TD error divided by the baseline's mean on that task (5-interval rolling mean)
+
+TD error caveats: it is in each run's normalized-reward units, and it is measured against each method's own target.
+With 2 critics, both are regressed to the min of the pair, so the higher critic carries an extra gap that a single
+critic does not; part of a 1-critic run's lower TD error is that mechanical difference, not a better critic.
+
+The two timing figures use only --speed_seeds (default seed1000 seed2000): every run of one of those seeds ran on the
+same instance, while seed 0 runs of different methods ran on different instances, which differ by up to ~10%.
+
 paper_vs_baseline.png / .csv compare our baseline (--paper_method) with the FlashSAC paper (--paper_csv): final return
 and AUC, ours - paper, in % and as z = difference / combined standard error.
 
@@ -387,6 +401,148 @@ def plot_auc(rows: list[dict], time_label: str, out_path: str) -> None:
     print(f"saved {out_path}")
 
 
+def load_timing(results_dirs: list[str], methods: Optional[list[str]], seeds: Optional[list[str]]) -> list[dict]:
+    """Final cumulative timers (minutes) of every complete d=2 run, one dict per run. seeds: run-folder prefixes to
+    keep (e.g. ['seed1000', 'seed2000']), or None for all."""
+    runs = []
+    for path in [p for d in results_dirs for p in glob.glob(os.path.join(d, "*", "*", "*", "metrics.csv"))]:
+        method, task_dir, run = path.split(os.sep)[-4:-1]
+        seed = run.split("_")[0]
+        if split_method(method)[1] is not None or (methods is not None and method not in methods):
+            continue
+        if seeds is not None and seed not in seeds:
+            continue
+        timed = [row for row in csv.DictReader(open(path)) if row.get("time/update_time")]
+        if not timed:
+            continue
+        last = timed[-1]
+        runs.append({"method": method, "task": short_task(task_dir), "seed": seed, "env_step": float(last["env_step"]),
+                     "update": float(last["time/update_time"]) / 60, "collect": float(last["time/collect_time"]) / 60,
+                     "eval": float(last["time/eval_time"]) / 60, "wall": float(last["wall_time"]) / 60})
+    final: dict[tuple[str, str], float] = defaultdict(float)
+    for r in runs:
+        final[(r["method"], r["task"])] = max(final[(r["method"], r["task"])], r["env_step"])
+    return [r for r in runs if r["env_step"] >= 0.99 * final[(r["method"], r["task"])]]  # complete runs only
+
+
+def style_axis(ax, grid_axis: str = "both") -> None:
+    ax.set_facecolor(SURFACE)
+    ax.grid(True, axis=grid_axis, color=GRID, lw=0.8)
+    ax.set_axisbelow(True)
+    ax.tick_params(colors=TEXT_2, labelsize=8, length=0)
+    for side in ("top", "right", "left"):
+        ax.spines[side].set_visible(False)
+    ax.spines["bottom"].set_color(GRID)
+
+
+def plot_update_time(runs: list[dict], seeds_note: str, out_path: str) -> None:
+    """Dot plot like auc.png: one panel per task, a row per method, seeds as small dots and the mean as the marker."""
+    tasks = [t for t in TASK_ORDER if any(r["task"] == t for r in runs)]
+    methods = sorted({r["method"] for r in runs}, key=method_sort_key)
+    fig, axes = plt.subplots(1, len(tasks), figsize=(3.6 * len(tasks), 0.42 * len(methods) + 1.9), squeeze=False,
+                             facecolor=SURFACE)
+    for j, task in enumerate(tasks):
+        ax = axes[0, j]
+        style_axis(ax, "x")
+        base = [r["update"] for r in runs if r["task"] == task and r["method"] == "baseline"]
+        for k, method in enumerate(methods):
+            values = [r["update"] for r in runs if r["task"] == task and r["method"] == method]
+            if not values:
+                continue
+            color, marker = style(split_method(method)[0])
+            yk = len(methods) - 1 - k
+            ax.scatter(values, [yk] * len(values), s=22, color=color, alpha=0.45, lw=0, zorder=2)
+            hollow = is_asym(method)
+            mean = float(np.mean(values))
+            ax.scatter([mean], [yk], s=70 * MARKER_SCALE.get(marker, 1) ** 2, marker=marker,
+                       facecolors=SURFACE if hollow else color, edgecolors=color if hollow else SURFACE,
+                       linewidths=1.8 if hollow else 1.5, zorder=3)
+            note = "" if method == "baseline" or not base else f"  {100 * (mean / np.mean(base) - 1):+.1f}%"
+            ax.annotate(f"{mean:.1f}{note}", xy=(mean, yk), xytext=(0, 9), textcoords="offset points", ha="center",
+                        fontsize=8, color=TEXT_2)
+        ax.set_yticks(range(len(methods)))
+        ax.set_yticklabels([label(m) for m in reversed(methods)] if j == 0 else [], fontsize=8.5, color=TEXT)
+        ax.set_ylim(-0.6, len(methods) - 0.3)
+        ax.set_title(task, color=TEXT, fontsize=10.5, loc="left", fontweight="bold")
+        ax.set_xlabel("Minutes in gradient updates", color=TEXT_2, fontsize=8.5)
+        lo, hi = ax.get_xlim()
+        ax.set_xlim(lo - 0.1 * (hi - lo), hi + 0.1 * (hi - lo))
+    fig.suptitle(f"Time spent in network updates over the 50M-step run (large marker = mean, small dots = {seeds_note}; "
+                 f"% vs. baseline)", color=TEXT, fontsize=12, x=0.01, ha="left", fontweight="bold")
+    fig.tight_layout(rect=(0, 0, 1, 0.92))
+    fig.savefig(out_path, dpi=160, bbox_inches="tight", facecolor=SURFACE)
+    plt.close(fig)
+    print(f"saved {out_path}")
+
+
+# Parts of a run's wall-clock. Updates, the part the critic changes act on, carries the one saturated color; the rest
+# are neutral steps, each labeled inside its block (white on the dark fill, near-black on the light ones).
+TIME_PARTS = [("collect", "Env interaction (sim + actor + buffer insert)", "#bdbbb4", TEXT),
+              ("update", "Gradient updates", "#6250d6", "#ffffff"),
+              ("eval", "Evaluation", "#d9d7d0", TEXT),
+              ("other", "Other (logging, compile, start-up)", "#ebeae5", TEXT)]
+
+
+def plot_time_breakdown(runs: list[dict], seeds_note: str, out_path: str) -> None:
+    """One segmented bar per method: its mean wall-clock per run (over tasks and seeds), split into parts."""
+    methods = sorted({r["method"] for r in runs}, key=method_sort_key)
+    mean = {m: {k: float(np.mean([r[k] for r in runs if r["method"] == m])) for k in ("collect", "update", "eval", "wall")}
+            for m in methods}
+    for m in methods:
+        mean[m]["other"] = max(0.0, mean[m]["wall"] - mean[m]["collect"] - mean[m]["update"] - mean[m]["eval"])
+    fig, ax = plt.subplots(figsize=(10.5, 0.62 * len(methods) + 1.9), facecolor=SURFACE)
+    style_axis(ax, "x")
+    longest = max(mean[m]["wall"] for m in methods)
+    for k, method in enumerate(methods):
+        yk = len(methods) - 1 - k
+        left = 0.0
+        for key, _, color, ink in TIME_PARTS:
+            width = mean[method][key]
+            ax.barh(yk, width, left=left, height=0.5, color=color, edgecolor=SURFACE, linewidth=1.5, zorder=2)
+            if width > 0.07 * longest:  # label only blocks wide enough for the text
+                ax.text(left + 0.6, yk, f"{width:.1f}", va="center", ha="left", fontsize=8.5, color=ink, zorder=3)
+            left += width
+        base = mean.get("baseline")
+        note = "" if method == "baseline" or base is None else (
+            f"   wall {100 * (mean[method]['wall'] / base['wall'] - 1):+.1f}%,"
+            f" updates {100 * (mean[method]['update'] / base['update'] - 1):+.1f}%")
+        ax.text(left + 0.5, yk, f"{mean[method]['wall']:.1f} min{note}", va="center", ha="left", fontsize=8.5,
+                color=TEXT_2)
+    ax.set_yticks(range(len(methods)))
+    ax.set_yticklabels([label(m) for m in reversed(methods)], fontsize=9, color=TEXT)
+    ax.set_ylim(-0.6, len(methods) - 0.4)
+    ax.set_xlim(0, longest * 1.42)
+    ax.set_xlabel("Minutes per 50M-step run", color=TEXT_2, fontsize=9)
+    handles = [plt.Rectangle((0, 0), 1, 1, color=c) for _, _, c, _ in TIME_PARTS]
+    fig.legend(handles, [name for _, name, _, _ in TIME_PARTS], loc="upper left", ncol=4, frameon=False, fontsize=9,
+               labelcolor=TEXT, bbox_to_anchor=(0.0, 0.93))
+    fig.suptitle(f"Where the wall-clock goes (mean over the 4 tasks and {seeds_note})", color=TEXT, fontsize=12,
+                 x=0.01, ha="left", fontweight="bold")
+    fig.tight_layout(rect=(0, 0, 1, 0.87))
+    fig.savefig(out_path, dpi=160, bbox_inches="tight", facecolor=SURFACE)
+    plt.close(fig)
+    print(f"saved {out_path}")
+
+
+def rolling_mean(y: np.ndarray, window: int) -> np.ndarray:
+    """Centered rolling mean that keeps the length (the window shrinks at the ends)."""
+    half = window // 2
+    return np.array([y[max(0, i - half): i + half + 1].mean() for i in range(len(y))])
+
+
+def ratio_to_baseline(runs: dict, window: int = 5) -> dict:
+    """Each run's (smoothed) series divided by the baseline's mean series on the same task, point by point."""
+    out = {}
+    for (method, task), rs in runs.items():
+        base = runs.get(("baseline", task))
+        if not base:
+            continue
+        n = min(len(base[0]["y"]), *(len(r["y"]) for r in rs))
+        base_mean = np.mean([rolling_mean(b["y"][:n], window) for b in base], axis=0)
+        out[(method, task)] = [{"x": r["x"][:n], "y": rolling_mean(r["y"][:n], window) / base_mean} for r in rs]
+    return out
+
+
 PAPER_CSV = "results/stateRL_gpusim/FlashSAC.csv"
 
 
@@ -505,6 +661,8 @@ def main() -> None:
     parser.add_argument("--suffix", default="", help="appended to the figure file names, e.g. _critic")
     parser.add_argument("--paper_csv", default=PAPER_CSV, help="the FlashSAC paper's results, for paper_vs_<method>")
     parser.add_argument("--paper_method", default="baseline", help="which of our methods to compare with the paper")
+    parser.add_argument("--speed_seeds", nargs="+", default=["seed1000", "seed2000"],
+                        help="run-folder seed prefixes used by the timing figures, or 'all'")
     args = parser.parse_args()
 
     out_dir = args.out_dir or os.path.join(args.results_dir[0], "plots")
@@ -518,6 +676,8 @@ def main() -> None:
         ("return_vs_steps", "avg_return", "env_step", "Eval return", "Eval return vs. environment steps", {}),
         (f"return_vs_{args.time}_time", "avg_return", time_key, "Eval return", "Eval return vs. wall-clock time",
          {"x_label": time_label, "x_in_label": "min"}),
+        ("critic_td_error", "critic/td_abs", "env_step", "Critic TD error |E[Q] − E[target]| (log)",
+         "Critic TD error vs. environment steps", {"log_y": True, "note": "normalized-reward units"}),
     ]
     found = False
     for name, y_key, x_key, y_label, title, opts in figures:
@@ -539,6 +699,26 @@ def main() -> None:
         budget_label = "wall-clock budget" if args.time == "wall" else "training-time budget"
         write_auc_csv(rows, os.path.join(out_dir, f"auc{args.suffix}.csv"))
         plot_auc(rows, budget_label, os.path.join(out_dir, f"auc{args.suffix}.png"))
+
+    # timing diagnostics (d=2), from runs that shared an instance per seed
+    seeds = None if args.speed_seeds == ["all"] else args.speed_seeds
+    timing = load_timing(args.results_dir, args.methods, seeds)
+    if not timing and seeds is not None:  # e.g. a folder with only seed 0: fall back to every seed
+        seeds, timing = None, load_timing(args.results_dir, args.methods, None)
+    if timing:
+        names = sorted({r["seed"] for r in timing})
+        seeds_note = f"seeds {', '.join(n.replace('seed', '') for n in names)}"
+        plot_update_time(timing, seeds_note, os.path.join(out_dir, f"update_time{args.suffix}.png"))
+        plot_time_breakdown(timing, seeds_note, os.path.join(out_dir, f"time_breakdown{args.suffix}.png"))
+
+    # critic TD error relative to the baseline (d=2)
+    td = {k: v for k, v in load(args.results_dir, "critic/td_abs", "env_step").items()
+          if split_method(k[0])[1] is None and (args.methods is None or k[0] in args.methods)}
+    ratio = ratio_to_baseline(td)
+    if ratio:
+        plot(ratio, steps, "TD error ÷ baseline's mean TD error", "Critic TD error relative to the baseline",
+             os.path.join(out_dir, f"critic_td_ratio{args.suffix}.png"),
+             note="below 1 = lower error than the baseline; 5-interval rolling mean")
 
     # our baseline vs. the paper, on the paper's step axis (the logging step)
     if os.path.exists(args.paper_csv) and (args.methods is None or args.paper_method in args.methods):
