@@ -14,10 +14,6 @@ Note: architectural changes were not impressive enough
 - [x] Online + 1 wide critic
 - [x] Online + 1 critic + asymmetric critic (note: g6e.2x large runs are currently running, g6e.4xlarge runs are not done yet, will be done soon)
 - [x] Online + 1 wide critic + asymmetric critic (note: g6e.2x large runs are currently running, g6e.4xlarge runs are not done yet, will be done soon)
----
-- [ ] Online + asymmetric critic (not absolutely necessary, less important than additional ablations, can be cut if need be)
-- [ ] 1 critic + asymmetric critic (not absolutely necessary, less important than additional ablations, can be cut if need be)
-- [ ] 1 wide critic + asymmetric critic (not absolutely necessary, less important than additional ablations, can be cut if need be)
 
 ## Additional Ablations
 - We make 12 main runs to understand the importance of each of the features
@@ -30,3 +26,8 @@ Note: architectural changes were not impressive enough
 ## Note on Timing
 - Running on Shiyu's local lab setup does not give an exactly fair time comparison to running on AWS
 - For the additional ablations, we can just make steps vs td error or steps vs performance, so we can use the results from the local lab setup without issue
+
+## Extras (Not 100% necessary, can be cut if we're short on compute)
+- [ ] Online + asymmetric critic (not absolutely necessary, less important than additional ablations, can be cut if need be)
+- [ ] 1 critic + asymmetric critic (not absolutely necessary, less important than additional ablations, can be cut if need be)
+- [ ] 1 wide critic + asymmetric critic (not absolutely necessary, less important than additional ablations, can be cut if need be)
