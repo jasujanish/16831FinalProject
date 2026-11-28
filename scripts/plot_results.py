@@ -40,6 +40,11 @@ an eval, would shift the curves ~0.5M steps left and raise every AUC by ~0.35.)
 Asymmetric-critic runs: a method named <method>_asym (e.g. crossq_1q_w360_asym) is drawn in the color and marker of
 <method>, with a dashed line and a hollow marker, and labeled "<method label> + asym. critic".
 
+Target-network variants: baseline_1q ("1 critic") and baseline_1q_w360 ("1 wide critic") keep the target network and
+differ from crossq_1q / crossq_1q_w360 only in that. Each is drawn in its Online partner's color and marker with a
+dotted line, so the pair reads as one critic design with and without the target network. (A 5th and 6th hue from the
+palette fail the colorblind-safety validator next to the 4 main methods; this composite encoding avoids new hues.)
+
 Rafay's runs, compared with our baseline:
     python scripts/plot_results.py --results_dir results/rafay results/nish \
         --methods baseline architecture_linear_bottleneck architecture_swiglu --out_dir results/rafay/plots
@@ -84,6 +89,9 @@ LABELS = {
     "crossq_asym": "Online + asym. critic",
     "crossq_1q_asym": "Online, 1 critic + asym. critic",
     "crossq_1q_w360_asym": "Online, 1 wide critic + asym. critic",
+    # target-network variants (no agent.critic_target=online)
+    "baseline_1q": "1 critic",
+    "baseline_1q_w360": "1 wide critic",
 }
 COLORS = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#6250d6", "#e34948"]
 MARKERS = ["o", "s", "^", "D", "v", "P", "X", "*"]
@@ -102,10 +110,20 @@ def asym_partner(base: str) -> tuple[str, bool]:
     return (base[: -len(ASYM_SUFFIX)], True) if base.endswith(ASYM_SUFFIX) else (base, False)
 
 
+# method that keeps the target network -> its Online partner, whose color and marker it shares (dotted line)
+TARGET_PARTNER = {"baseline_1q": "crossq_1q", "baseline_1q_w360": "crossq_1q_w360"}
+
+
+def is_target_variant(method: str) -> bool:
+    return asym_partner(split_method(method)[0])[0] in TARGET_PARTNER
+
+
 def style(base: str) -> tuple[str, str]:
     """(color, marker) of a base method: its fixed slot, or the next free slot for a method not listed above.
-    An asymmetric variant shares its partner's slot; line_style() and hollow() tell the two apart."""
+    An asymmetric variant shares its partner's slot; line_style() and hollow() tell the two apart. A target-network
+    variant (TARGET_PARTNER) shares its Online partner's slot and is drawn dotted."""
     base = asym_partner(base)[0]
+    base = TARGET_PARTNER.get(base, base)
     if base not in SLOTS:
         SLOTS[base] = len(SLOTS) % len(COLORS)
     return COLORS[SLOTS[base]], MARKERS[SLOTS[base] % len(MARKERS)]
@@ -116,7 +134,7 @@ def is_asym(method: str) -> bool:
 
 
 def line_style(method: str) -> str:
-    return "--" if is_asym(method) else "-"
+    return "--" if is_asym(method) else ":" if is_target_variant(method) else "-"
 TASK_ORDER = ["Flat-G1", "Rough-G1", "Flat-H1", "Rough-H1"]
 
 SURFACE, TEXT, TEXT_2, GRID = "#fcfcfb", "#0b0b0b", "#52514e", "#e4e3df"
@@ -183,12 +201,14 @@ def by_delay(runs: dict) -> dict[int, dict]:
     return groups
 
 
-def method_sort_key(method: str) -> tuple[int, int, str, int]:
-    """Order of the methods in legends and tables; an asymmetric variant comes right after its partner."""
+def method_sort_key(method: str) -> tuple[int, int, int, str, int]:
+    """Order of the methods in legends and tables; an asymmetric variant comes right after its partner, and a
+    target-network variant right after its Online partner."""
     base, delay = split_method(method)
     partner, asym = asym_partner(base)
-    rank = METHOD_ORDER.index(partner) if partner in METHOD_ORDER else len(METHOD_ORDER)
-    return rank, int(asym), partner, delay or 0
+    online = TARGET_PARTNER.get(partner, partner)
+    rank = METHOD_ORDER.index(online) if online in METHOD_ORDER else len(METHOD_ORDER)
+    return rank, int(partner in TARGET_PARTNER), int(asym), partner, delay or 0
 
 
 def spread_labels(ys: list[float], min_gap: float) -> list[float]:
