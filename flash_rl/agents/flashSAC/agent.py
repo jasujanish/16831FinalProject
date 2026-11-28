@@ -45,9 +45,13 @@ class FlashSACConfig:
     buffer_device_type: str
     sample_batch_size: int
 
-    sampler: str  # 'uniform' | 'swd' | 'laber'
+    sampler: str  # 'uniform' | 'swd' | 'laber' | 'window'
     swd_decay_steps: int
     swd_min_weight: float
+    window_start_size: int
+    window_end_size: int
+    window_grow_start: int
+    window_grow_end: int
     laber_multiplier: int
 
     learning_rate_init: float
@@ -420,7 +424,7 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
         )
         self._device = torch.device(device_type)
 
-        assert cfg.sampler in ("uniform", "swd", "laber"), f"Unknown sampler: {cfg.sampler}"
+        assert cfg.sampler in ("uniform", "swd", "laber", "window"), f"Unknown sampler: {cfg.sampler}"
         assert cfg.actor_lr_schedule in ("actor_step", "global_step")
         assert cfg.critic_target in CRITIC_TARGETS, f"Unknown critic target: {cfg.critic_target}"
         # LaBER's scoring (`compute_td_surprise`) always builds its targets from the target network
@@ -488,9 +492,13 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
             sample_batch_size=self._cfg.sample_batch_size,
             device_type=self._cfg.buffer_device_type,
             # LaBER draws its candidates uniformly and re-samples them in `update`
-            sampler="swd" if self._cfg.sampler == "swd" else "uniform",
+            sampler=self._cfg.sampler if self._cfg.sampler in ("swd", "window") else "uniform",
             swd_decay_steps=self._cfg.swd_decay_steps,
             swd_min_weight=self._cfg.swd_min_weight,
+            window_start_size=self._cfg.window_start_size,
+            window_end_size=self._cfg.window_end_size,
+            window_grow_start=self._cfg.window_grow_start,
+            window_grow_end=self._cfg.window_grow_end,
         )
 
     def sample_actions(
@@ -661,6 +669,7 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
         update_info["actor/learning_rate"] = self._actor.optimizer.param_groups[0]["lr"]  # type: ignore
         update_info["critic/learning_rate"] = self._critic.optimizer.param_groups[0]["lr"]  # type: ignore
         update_info["replay/size"] = float(len(self._replay_buffer))
+        update_info["replay/window"] = float(self._replay_buffer.window_length)
 
         return update_info
 

@@ -13,6 +13,8 @@
 #   scripts/run_humanoid.sh uniform_d2
 #   scripts/run_humanoid.sh swd_d2      agent.sampler=swd
 #   scripts/run_humanoid.sh laber_d2    agent.sampler=laber
+#   scripts/run_humanoid.sh window_1to10M agent.sampler=window                      # growing replay window
+#   scripts/run_humanoid.sh buffer_1M   agent.buffer_max_length=1_000_000            # its fixed-1M control
 #   scripts/run_humanoid.sh uniform_d4  agent.actor_update_period=4 agent.actor_lr_schedule=global_step
 #   scripts/run_humanoid.sh uniform_ema agent.actor_delay=ema agent.actor_delay_ema_interval=100 \
 #                                       agent.actor_lr_schedule=global_step

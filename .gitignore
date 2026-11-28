@@ -165,3 +165,4 @@ models/**
 # full result bundles pulled from AWS (checkpoints, TensorBoard, console logs; ~0.5 GB per batch)
 results/nish_full/
 results/rafay_full/
+results/ours/

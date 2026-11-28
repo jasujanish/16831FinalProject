@@ -18,10 +18,17 @@ sample_batch_size: 2048
 #            with age in interaction steps.
 #   laber:   draw laber_multiplier * sample_batch_size transitions uniformly, then keep sample_batch_size
 #            of them with probability ∝ TD surprise (importance-weighted critic loss).
-sampler: 'uniform'        # ['uniform', 'swd', 'laber']
+#   window:  uniform over the newest W transitions only. W = window_start_size until window_grow_start transitions were
+#            added, then grows linearly to window_end_size at window_grow_end. No importance correction.
+#            All four are in transitions (about env steps). Needs window_end_size <= buffer_max_length.
+sampler: 'uniform'        # ['uniform', 'swd', 'laber', 'window']
 swd_decay_steps: 2000
 swd_min_weight: 0.1
 laber_multiplier: 4
+window_start_size: 1_000_000
+window_end_size: 10_000_000
+window_grow_start: 15_000_000
+window_grow_end: 30_000_000
 
 normalize_reward: true
 normalized_G_max: 5.0
