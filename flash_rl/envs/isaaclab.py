@@ -1,4 +1,5 @@
-from typing import Any, Union, cast
+import copy
+from typing import Any, Optional, Union, cast
 
 import gymnasium as gym
 import numpy as np
@@ -38,6 +39,22 @@ def recursive_to_numpy(
         return data
 
 
+def add_privileged_critic_group(env_cfg: Any) -> None:
+    """
+    Add a `critic` observation group to a manager-based IsaacLab env config: a copy of the `policy` group with
+    observation noise turned off (IsaacLab corrupts the policy observations, e.g. joint velocities and height scan).
+
+    The env then returns [policy obs, critic obs]. With `agent.asymmetric_observation=true` the actor reads only the
+    noisy policy part and the critic reads both, so the trained policy needs nothing extra at deployment.
+    """
+    observations = env_cfg.observations
+    if getattr(observations, "critic", None) is not None:
+        raise ValueError("The env config already has a `critic` observation group.")
+    critic = copy.deepcopy(observations.policy)
+    critic.enable_corruption = False
+    observations.critic = critic
+
+
 class IsaacLabVectorEnv(
     VectorEnv[Union[torch.Tensor, F32NDArray], Union[torch.Tensor, F32NDArray], Union[torch.Tensor, F32NDArray]]
 ):
@@ -53,6 +70,12 @@ class IsaacLabVectorEnv(
         seed (int):
         action_bounds (float):
         to_numpy (bool): If True, will convert all outputs from jnp.ndarray to np.array.
+        video_dir (str): If given, the first `video_length` steps are recorded to an mp4 file in this directory.
+            Works headless (off-screen rendering).
+        video_length (int): Number of steps to record.
+        follow_robot (bool): If True, the camera follows the robot of the first environment.
+        privileged_critic (bool): If True, add a noise-free `critic` observation group (see
+            `add_privileged_critic_group`). Use together with `agent.asymmetric_observation=true`.
     """
 
     def __init__(
@@ -64,10 +87,15 @@ class IsaacLabVectorEnv(
         action_bounds: float,
         to_numpy: bool = True,
         headless: bool = True,
+        video_dir: Optional[str] = None,
+        video_length: int = 500,
+        follow_robot: bool = False,
+        privileged_critic: bool = False,
     ):
         from isaaclab.app import AppLauncher
 
-        app_launcher = AppLauncher(headless=headless, device=device, enable_cameras=not headless)
+        record_video = video_dir is not None
+        app_launcher = AppLauncher(headless=headless, device=device, enable_cameras=record_video or not headless)
         self.simulation_app = app_launcher.app
 
         from isaaclab_tasks.utils.parse_cfg import parse_env_cfg
@@ -77,10 +105,34 @@ class IsaacLabVectorEnv(
             device=device,
             num_envs=num_envs,
         )
+        if privileged_critic:
+            add_privileged_critic_group(env_cfg)
         env_cfg.seed = seed
+        # Debug-visualization markers (e.g. the velocity-command arrows) only appear in rendered frames, and creating
+        # their materials can hang on headless servers. Skip them unless a video is recorded.
+        commands_cfg = getattr(env_cfg, "commands", None)  # direct-workflow envs have no command manager
+        if headless and not record_video and commands_cfg is not None:
+            for term_cfg in vars(commands_cfg).values():
+                if hasattr(term_cfg, "debug_vis"):
+                    term_cfg.debug_vis = False
         self.seed = seed
         self.device = device
-        self.envs = gym.make(env_name, cfg=env_cfg, render_mode=None)
+        if follow_robot:
+            env_cfg.viewer.origin_type = "asset_root"
+            env_cfg.viewer.asset_name = "robot"
+            env_cfg.viewer.env_index = 0
+        self.envs = gym.make(env_name, cfg=env_cfg, render_mode="rgb_array" if record_video else None)
+
+        self._video_recorder: Optional[Any] = None
+        if video_dir is not None:
+            self._video_recorder = gym.wrappers.RecordVideo(
+                self.envs,
+                video_folder=video_dir,
+                step_trigger=lambda step: step == 0,
+                video_length=video_length,
+                disable_logger=True,
+            )
+            self.envs = self._video_recorder
 
         self.num_envs = cast(Any, self.envs.unwrapped).num_envs
         self.max_episode_steps = cast(Any, self.envs.unwrapped).max_episode_length
@@ -89,14 +141,20 @@ class IsaacLabVectorEnv(
         # Get observation/action spaces
         # NOTE: Action range: [-1, 1] * action_bounds (https://github.com/google-deepmind/mujoco_playground/issues/19)
         self.obs_size = cast(Any, self.envs.unwrapped).single_observation_space["policy"].shape
-        self.asymmetric_obs = "critic" in cast(Any, self.envs.unwrapped).single_observation_space
+        # NOTE: `"critic" in <gym.spaces.Dict>` asks whether the string is a sample of the space, which is always
+        # False, so check the keys. The critic group is used only when it was requested: tasks that ship their own
+        # critic group keep their previous (symmetric) behavior.
+        self.asymmetric_obs = (
+            privileged_critic and "critic" in cast(Any, self.envs.unwrapped).single_observation_space.spaces
+        )
         if self.asymmetric_obs:
             # NOTE: Env will treat concatenate actor & critic states as the observation,
             # but will give 'actual' observation size in the info.
             self.critic_obs_size = cast(Any, self.envs.unwrapped).single_observation_space["critic"].shape
-            # NOTE: setting to [0, 0] since we only need the shape and dtype
+            # NOTE: setting to [0, 0] since we only need the shape and dtype.
+            # The sizes are shape tuples: add their last dimensions (concatenating the tuples gives a 2-D shape).
             self.single_observation_space = gym.spaces.Box(
-                low=0.0, high=0.0, shape=self.obs_size + self.critic_obs_size, dtype=np.float32
+                low=0.0, high=0.0, shape=(self.obs_size[-1] + self.critic_obs_size[-1],), dtype=np.float32
             )
             self.observation_space = batch_space(self.single_observation_space, self.num_envs)
         else:
@@ -184,12 +242,21 @@ class IsaacLabVectorEnv(
     def render(self) -> None:
         raise NotImplementedError("We don't support rendering for IsaacLab environments")
 
+    def finish_video(self) -> None:
+        """Write the video file if it is still being recorded (fewer than `video_length` steps were taken)."""
+        if self._video_recorder is not None and self._video_recorder.recording:
+            self._video_recorder.stop_recording()
+
 
 def make_isaaclab_env(
     env_name: str,
     num_envs: int,
     seed: int,
     headless: bool = True,
+    video_dir: Optional[str] = None,
+    video_length: int = 500,
+    follow_robot: bool = False,
+    privileged_critic: bool = False,
 ) -> IsaacLabVectorEnv:
     if env_name not in ACTION_BOUNDS:
         print(f"Action bounds not defined for {env_name}; using default value 1.0.")
@@ -202,5 +269,9 @@ def make_isaaclab_env(
         action_bounds=action_bounds,
         to_numpy=True,
         headless=headless,
+        video_dir=video_dir,
+        video_length=video_length,
+        follow_robot=follow_robot,
+        privileged_critic=privileged_critic,
     )
     return env

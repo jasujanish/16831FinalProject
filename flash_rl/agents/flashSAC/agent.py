@@ -1,7 +1,7 @@
 import math
 import os
 from dataclasses import dataclass, replace
-from typing import Any, MutableMapping, Optional, cast
+from typing import Any, Callable, MutableMapping, Optional, cast
 
 import gymnasium as gym
 import torch
@@ -9,12 +9,16 @@ import torch.optim as optim
 from torch.amp.grad_scaler import GradScaler
 
 from flash_rl.agents.base_agent import BaseAgent
+from flash_rl.agents.flashSAC.actor_delay import ActorDelay
 from flash_rl.agents.flashSAC.network import (
     FlashSACActor,
     FlashSACDoubleCritic,
     FlashSACTemperature,
 )
 from flash_rl.agents.flashSAC.update import (
+    CRITIC_TARGETS,
+    compute_td_surprise,
+    pearson_corr,
     update_actor,
     update_critic,
     update_target_network,
@@ -41,6 +45,11 @@ class FlashSACConfig:
     buffer_device_type: str
     sample_batch_size: int
 
+    sampler: str  # 'uniform' | 'swd' | 'laber'
+    swd_decay_steps: int
+    swd_min_weight: float
+    laber_multiplier: int
+
     learning_rate_init: float
     learning_rate_peak: float
     learning_rate_end: float
@@ -51,10 +60,18 @@ class FlashSACConfig:
 
     actor_num_blocks: int
     actor_hidden_dim: int
+    block_type: str
     actor_bc_alpha: float
     actor_noise_zeta_mu: float
     actor_noise_zeta_max: int
     actor_update_period: int
+    actor_delay: str  # 'fixed' | 'ema'
+    actor_delay_ema_interval: int
+    actor_delay_ema_beta: float
+    actor_delay_ema_scale: float
+    actor_delay_ema_min: float
+    actor_delay_ema_max: float
+    actor_lr_schedule: str  # 'actor_step' | 'global_step'
 
     critic_num_blocks: int
     critic_hidden_dim: int
@@ -62,6 +79,11 @@ class FlashSACConfig:
     critic_min_v: float
     critic_max_v: float
     critic_target_update_tau: float
+    critic_target: str  # 'target' | 'online' | 'minto' | 'minto_net'
+    critic_num_qs: int
+    critic_surprise_weight_alpha: float
+    critic_surprise_weight_min: float
+    critic_surprise_weight_max: float
 
     temp_initial_value: float
     temp_target_sigma: float
@@ -78,15 +100,8 @@ class FlashSACConfig:
     load_reward_normalizer: bool
 
 
-def _init_flashsac_networks(
-    actor_observation_dim: int,
-    critic_observation_dim: int,
-    action_dim: int,
-    cfg: FlashSACConfig,
-    device: torch.device,
-) -> tuple[Network, Network, Network, Network]:
-    # Create learning rate schedule
-    warmup_cosine_decay_lr = warmup_cosine_decay_scheduler(
+def _make_lr_schedule(cfg: FlashSACConfig) -> Callable[[int], float]:
+    return warmup_cosine_decay_scheduler(
         init_value=cfg.learning_rate_init,
         peak_value=cfg.learning_rate_peak,
         end_value=cfg.learning_rate_end,
@@ -94,20 +109,39 @@ def _init_flashsac_networks(
         decay_steps=cfg.learning_rate_decay_step,
     )
 
+
+def _init_flashsac_networks(
+    actor_observation_dim: int,
+    critic_observation_dim: int,
+    action_dim: int,
+    cfg: FlashSACConfig,
+    device: torch.device,
+    global_step_fn: Optional[Callable[[], int]] = None,
+) -> tuple[Network, Network, Network, Network]:
+    """
+    global_step_fn: if given, the actor and temperature learning rates follow this step count
+        (the number of critic updates) instead of their own number of updates.
+    """
+    # Create learning rate schedule
+    warmup_cosine_decay_lr = _make_lr_schedule(cfg)
+
+    def actor_lr_lambda(step: int) -> float:
+        if global_step_fn is not None:
+            step = global_step_fn()
+        return warmup_cosine_decay_lr(step) / cfg.learning_rate_peak
+
     # Initialize actor
     actor_net = FlashSACActor(
         num_blocks=cfg.actor_num_blocks,
         input_dim=actor_observation_dim,
         hidden_dim=cfg.actor_hidden_dim,
         action_dim=action_dim,
+        block_type=cfg.block_type,
     ).to(device)
 
     use_fused = device.type == "cuda" and torch.cuda.is_available()
     actor_optimizer = optim.Adam(actor_net.parameters(), lr=cfg.learning_rate_peak, fused=use_fused)
-    actor_scheduler = torch.optim.lr_scheduler.LambdaLR(
-        actor_optimizer,
-        lr_lambda=lambda step: warmup_cosine_decay_lr(step) / cfg.learning_rate_peak,
-    )
+    actor_scheduler = torch.optim.lr_scheduler.LambdaLR(actor_optimizer, lr_lambda=actor_lr_lambda)
     actor = Network(
         network=actor_net,
         optimizer=actor_optimizer,
@@ -128,6 +162,8 @@ def _init_flashsac_networks(
         num_bins=cfg.critic_num_bins,
         min_v=cfg.critic_min_v,
         max_v=cfg.critic_max_v,
+        num_qs=cfg.critic_num_qs,
+        block_type=cfg.block_type,
     ).to(device)
 
     critic_optimizer = optim.Adam(
@@ -156,6 +192,8 @@ def _init_flashsac_networks(
         num_bins=cfg.critic_num_bins,
         min_v=cfg.critic_min_v,
         max_v=cfg.critic_max_v,
+        num_qs=cfg.critic_num_qs,
+        block_type=cfg.block_type,
     ).to(device)
     target_critic_net.load_state_dict(critic_net.state_dict())
     target_critic = Network(
@@ -176,10 +214,7 @@ def _init_flashsac_networks(
         lr=cfg.learning_rate_peak,
         fused=use_fused,
     )
-    temp_scheduler = torch.optim.lr_scheduler.LambdaLR(
-        temp_optimizer,
-        lr_lambda=lambda step: warmup_cosine_decay_lr(step) / cfg.learning_rate_peak,
-    )
+    temp_scheduler = torch.optim.lr_scheduler.LambdaLR(temp_optimizer, lr_lambda=actor_lr_lambda)
     temperature = Network(
         network=temp_net,
         optimizer=temp_optimizer,
@@ -259,6 +294,7 @@ def _sample_flashsac_actions(
 
 def _update_networks(
     batch: dict[str, torch.Tensor],
+    actor_batch: dict[str, torch.Tensor],
     actor: Network,
     critic: Network,
     target_critic: Network,
@@ -274,7 +310,7 @@ def _update_networks(
             actor=actor,
             critic=critic,
             temperature=temperature,
-            batch=batch,  # type: ignore
+            batch=actor_batch,  # type: ignore
             bc_alpha=cfg.actor_bc_alpha,
             device=device,
             use_amp=cfg.use_amp,
@@ -306,11 +342,18 @@ def _update_networks(
         device=device,
         use_amp=cfg.use_amp,
         grad_scaler=grad_scaler,
+        critic_target=cfg.critic_target,
+        surprise_weight_alpha=cfg.critic_surprise_weight_alpha,
+        surprise_weight_min=cfg.critic_surprise_weight_min,
+        surprise_weight_max=cfg.critic_surprise_weight_max,
     )
 
-    target_critic_info = update_target_network(
-        target_network=target_critic,
-    )
+    # without a target network (CrossQ-style) the target critic is unused and keeps its initial weights
+    target_critic_info: dict[str, torch.Tensor] = {}
+    if cfg.critic_target != "online":
+        target_critic_info = update_target_network(
+            target_network=target_critic,
+        )
 
     # Merge all info dicts
     update_info = {
@@ -347,6 +390,11 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
 
         self._critic_observation_dim: int = observation_space.shape[-1]  # type: ignore
         self._action_dim: int = action_space.shape[-1]  # type: ignore
+        if env_info.get("asymmetric_obs", False) and not cfg.asymmetric_observation:
+            raise ValueError(
+                "The env returns [actor obs, privileged critic obs]; set agent.asymmetric_observation=true, "
+                "otherwise the actor would be trained on the privileged observations."
+            )
         if cfg.asymmetric_observation:
             self._actor_observation_dim = env_info["actor_observation_size"][-1]
         else:
@@ -372,6 +420,26 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
         )
         self._device = torch.device(device_type)
 
+        assert cfg.sampler in ("uniform", "swd", "laber"), f"Unknown sampler: {cfg.sampler}"
+        assert cfg.actor_lr_schedule in ("actor_step", "global_step")
+        assert cfg.critic_target in CRITIC_TARGETS, f"Unknown critic target: {cfg.critic_target}"
+        # LaBER's scoring (`compute_td_surprise`) always builds its targets from the target network
+        assert cfg.sampler != "laber" or cfg.critic_target == "target", "LaBER requires critic_target='target'"
+        assert cfg.critic_num_qs >= 1, f"critic_num_qs must be >= 1, got {cfg.critic_num_qs}"
+        assert cfg.critic_surprise_weight_alpha >= 0.0
+        assert 0.0 < cfg.critic_surprise_weight_min <= 1.0 <= cfg.critic_surprise_weight_max
+        self._update_step = 0
+        self._lr_schedule = _make_lr_schedule(cfg)
+        self._actor_delay = ActorDelay(
+            mode=cfg.actor_delay,
+            period=cfg.actor_update_period,
+            interval=cfg.actor_delay_ema_interval,
+            beta=cfg.actor_delay_ema_beta,
+            scale=cfg.actor_delay_ema_scale,
+            min_delay=cfg.actor_delay_ema_min,
+            max_delay=cfg.actor_delay_ema_max,
+        )
+
         # Initialize networks
         (
             self._actor,
@@ -384,8 +452,8 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
             action_dim=self._action_dim,
             cfg=self._cfg,
             device=self._device,
+            global_step_fn=(lambda: self._update_step) if cfg.actor_lr_schedule == "global_step" else None,
         )
-        self._update_step = 0
 
         # Grad scaler for FP16 AMP
         self._grad_scaler = GradScaler(device=self._device.type, enabled=self._cfg.use_amp)
@@ -419,6 +487,10 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
             min_length=self._cfg.buffer_min_length,
             sample_batch_size=self._cfg.sample_batch_size,
             device_type=self._cfg.buffer_device_type,
+            # LaBER draws its candidates uniformly and re-samples them in `update`
+            sampler="swd" if self._cfg.sampler == "swd" else "uniform",
+            swd_decay_steps=self._cfg.swd_decay_steps,
+            swd_min_weight=self._cfg.swd_min_weight,
         )
 
     def sample_actions(
@@ -472,8 +544,54 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
     def can_start_training(self) -> bool:
         return self._replay_buffer.can_sample()
 
+    def _select_laber_batch(
+        self, candidates: dict[str, torch.Tensor]
+    ) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
+        """
+        LaBER (https://arxiv.org/abs/2110.01528): score a large uniform batch with the current networks,
+        then draw the training batch from it with probability proportional to the score.
+        The "weight" entry is the importance weight that corrects the critic update for the selection.
+        """
+        batch_size = self._cfg.sample_batch_size
+        surprise, td_abs = compute_td_surprise(
+            actor=self._actor,
+            critic=self._critic,
+            target_critic=self._target_critic,
+            temperature=self._temperature,
+            batch=candidates,  # type: ignore
+            min_v=self._cfg.critic_min_v,
+            max_v=self._cfg.critic_max_v,
+            num_bins=self._cfg.critic_num_bins,
+            gamma=self._cfg.gamma,
+            n_step=self._cfg.n_step,
+            device=self._device,
+            use_amp=self._cfg.use_amp,
+        )
+        priorities = surprise + 1e-6
+        idxs = torch.multinomial(priorities, batch_size, replacement=True)
+        batch = {k: v[idxs] for k, v in candidates.items()}
+        weights = priorities.mean() / priorities[idxs]
+        batch["weight"] = weights
+
+        info = {
+            # the candidates are a uniform sample of the buffer
+            "laber/candidate_surprise_mean": surprise.mean(),
+            "laber/candidate_surprise_max": surprise.max(),
+            "laber/candidate_td_abs": td_abs.mean(),
+            "laber/candidate_age_mean": candidates["age"].mean(),
+            "laber/candidate_age_surprise_corr": pearson_corr(candidates["age"], surprise),
+            # how concentrated the selection is
+            "laber/weight_max": weights.max(),
+            "laber/effective_sample_frac": weights.sum() ** 2 / (weights.square().sum() * batch_size),
+            "laber/unique_frac": torch.unique(idxs).numel() / batch_size,
+        }
+        return batch, info
+
     def update(self) -> dict[str, Any]:
-        batch = cast(dict[str, torch.Tensor], self._replay_buffer.sample())
+        batch_size = self._cfg.sample_batch_size
+        use_laber = self._cfg.sampler == "laber"
+        num_samples = batch_size * self._cfg.laber_multiplier if use_laber else batch_size
+        batch = cast(dict[str, torch.Tensor], self._replay_buffer.sample(batch_size=num_samples))
 
         for k, v in batch.items():
             batch[k] = v.to(self._device, non_blocking=True)
@@ -490,32 +608,67 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
             # batch["unnormalized_reward"] = batch["reward"].clone()
             batch["reward"] = self.reward_normalizer.normalize_rewards(batch["reward"])
 
+        # The actor trains on the same batch as the critic, except under LaBER: there the critic gets the
+        # high-surprise selection and the actor a uniform slice of the candidates, so the policy objective
+        # needs no importance weights.
+        actor_batch = batch
+        sampler_info: dict[str, Any] = {}
+        if use_laber:
+            actor_batch = {k: v[:batch_size] for k, v in batch.items()}
+            batch, sampler_info = self._select_laber_batch(batch)
+
         # Update step
+        do_actor_update = self._actor_delay.should_update_actor(self._update_step)
+        if do_actor_update and self._cfg.actor_lr_schedule == "global_step":
+            # schedulers only refresh the learning rate after an optimizer step, i.e. one actor delay ago
+            lr = self._lr_schedule(self._update_step)
+            for network in (self._actor, self._temperature):
+                assert network.optimizer is not None
+                for param_group in network.optimizer.param_groups:
+                    param_group["lr"] = lr
         _update_info = _update_networks(
             batch=batch,
+            actor_batch=actor_batch,
             actor=self._actor,
             critic=self._critic,
             target_critic=self._target_critic,
             temperature=self._temperature,
             cfg=self._cfg,
-            do_actor_update=(self._update_step % self._cfg.actor_update_period == 0),
+            do_actor_update=do_actor_update,
             device=self._device,
             grad_scaler=self._grad_scaler,
         )
         self._update_step += 1
+        _update_info.update(sampler_info)
 
-        # Convert tensors to floats
+        # Convert tensors to floats (a single device sync for all of them)
         update_info: dict[str, float] = {}
+        tensor_keys = [k for k, v in _update_info.items() if isinstance(v, torch.Tensor)]
+        if tensor_keys:
+            values = torch.stack([_update_info[k].detach().float().reshape(()) for k in tensor_keys]).tolist()
+            update_info.update(zip(tensor_keys, values))
         for key, value in _update_info.items():
-            if isinstance(value, torch.Tensor):
-                update_info[key] = value.item()
-            elif not isinstance(value, dict):
+            if not isinstance(value, (torch.Tensor, dict)):
                 update_info[key] = float(value)
+
+        # Actor delay
+        self._actor_delay.observe(update_info["critic/td_abs"])
+        update_info["actor_delay/delay"] = self._actor_delay.delay
+        update_info["actor_delay/td_ratio"] = self._actor_delay.ratio
+        if self._actor_delay.ema is not None:
+            update_info["actor_delay/td_ema"] = self._actor_delay.ema
+        update_info["actor_delay/actor_updated"] = float(do_actor_update)
+        update_info["actor/learning_rate"] = self._actor.optimizer.param_groups[0]["lr"]  # type: ignore
+        update_info["critic/learning_rate"] = self._critic.optimizer.param_groups[0]["lr"]  # type: ignore
+        update_info["replay/size"] = float(len(self._replay_buffer))
 
         return update_info
 
     def save(self, path: str) -> None:
         os.makedirs(path, exist_ok=True)
+        if self._cfg.critic_target == "online":
+            # the unused target critic still holds its initial weights; save what `online` bootstraps from instead
+            self._target_critic.network.load_state_dict(self._critic.network.state_dict())
         self._actor.save(os.path.join(path, "actor.pt"))
         self._critic.save(os.path.join(path, "critic.pt"))
         self._target_critic.save(os.path.join(path, "target_critic.pt"))
@@ -526,6 +679,7 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
         agent_state: dict[str, Any] = {
             "update_step": self._update_step,
             "grad_scaler_state_dict": self._grad_scaler.state_dict(),
+            "actor_delay_state_dict": self._actor_delay.state_dict(),
         }
         torch.save(agent_state, os.path.join(path, "agent_state.pt"))
         print(f"\033[32m[FlashSAC]\033[0m Successfully saved checkpoint {self._update_step} at {path}.")
@@ -548,6 +702,8 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
             agent_state = torch.load(agent_state_path, map_location=self._device)
             self._update_step = agent_state["update_step"]
             self._grad_scaler.load_state_dict(agent_state["grad_scaler_state_dict"])
+            if "actor_delay_state_dict" in agent_state:
+                self._actor_delay.load_state_dict(agent_state["actor_delay_state_dict"])
 
         if self._cfg.load_reward_normalizer:
             assert self.reward_normalizer is not None

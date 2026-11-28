@@ -1,4 +1,5 @@
-from typing import Any, Optional
+import math
+from typing import Any, Optional, cast
 
 import torch
 from torch.amp.grad_scaler import GradScaler
@@ -27,6 +28,51 @@ def _select_min_q_log_probs(
         0
     ]  # (B, num_bins)
     return selected
+
+
+CRITIC_TARGETS = ("target", "online", "minto", "minto_net")
+
+
+def _select_target_log_probs(
+    critic_target: str,
+    online_qs: torch.Tensor,  # (2, B), detached
+    online_log_probs: torch.Tensor,  # (2, B, num_bins), detached
+    target_qs: Optional[torch.Tensor],  # (2, B); None for critic_target="online"
+    target_log_probs: Optional[torch.Tensor],  # (2, B, num_bins)
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """
+    Pick the next-state return distribution (B, num_bins) that the TD target is built from.
+    Each critic's Q-value is the mean of its distribution, and the distribution with the lowest Q is kept.
+
+    target:    FlashSAC. Clipped double Q over the 2 target critics.
+    online:    CrossQ-style, no target network. Clipped double Q over the 2 online critics.
+    minto:     MINTO (https://arxiv.org/abs/2510.02590). Lowest Q among the 2 target and 2 online critics.
+    minto_net: MINTO between networks only. Each network's 2 critics are first averaged (mixture
+               distribution, whose Q is the mean of the 2 Qs), then the network with the lower Q is kept.
+
+    Also returns, for the MINTO variants, a (B,) bool tensor: True where an online critic was chosen.
+    """
+    if critic_target == "online":
+        return _select_min_q_log_probs(online_qs, online_log_probs), None
+    assert target_qs is not None and target_log_probs is not None
+    if critic_target == "target":
+        return _select_min_q_log_probs(target_qs, target_log_probs), None
+    if critic_target == "minto":
+        qs = torch.cat([target_qs, online_qs], dim=0)  # (4, B)
+        log_probs = torch.cat([target_log_probs, online_log_probs], dim=0)  # (4, B, num_bins)
+    elif critic_target == "minto_net":
+        qs = torch.stack([target_qs.mean(dim=0), online_qs.mean(dim=0)])  # (2, B)
+        log_probs = torch.stack(
+            [
+                torch.logsumexp(target_log_probs, dim=0) - math.log(2.0),  # log((p1 + p2) / 2)
+                torch.logsumexp(online_log_probs, dim=0) - math.log(2.0),
+            ]
+        )
+    else:
+        raise ValueError(f"Unknown critic target: {critic_target}")
+    # the online candidates are the second half; ties go to the target network
+    online_chosen = qs.argmin(dim=0) >= qs.shape[0] // 2
+    return _select_min_q_log_probs(qs, log_probs), online_chosen
 
 
 @torch.compile
@@ -78,6 +124,100 @@ def _compute_categorical_td_target(
     return target_probs
 
 
+def _td_surprise(
+    pred_qs: torch.Tensor,  # (2, B)
+    pred_log_probs: torch.Tensor,  # (2, B, num_bins)
+    target_probs: torch.Tensor,  # (B, num_bins)
+    min_v: float,
+    max_v: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Per-sample critic error, averaged over the two critics. Both outputs have shape (B,).
+
+    surprise: ||softmax(logits) - target_probs||_2, the norm of the cross-entropy gradient w.r.t. the logits.
+    td_abs: |E[Z] - E[target]|, the absolute TD error between the distribution means.
+    """
+    target_probs = target_probs.float()
+    surprise = (pred_log_probs.float().exp() - target_probs.unsqueeze(0)).norm(dim=-1).mean(dim=0)
+    bin_values = torch.linspace(min_v, max_v, target_probs.shape[-1], device=target_probs.device)
+    target_qs = (target_probs * bin_values).sum(dim=-1)
+    td_abs = (pred_qs.float() - target_qs.unsqueeze(0)).abs().mean(dim=0)
+    return surprise, td_abs
+
+
+def surprise_weights(surprise: torch.Tensor, alpha: float, w_min: float, w_max: float) -> torch.Tensor:
+    """
+    In-batch prioritization weights for a uniformly sampled batch, shape (B,), mean 1.
+
+        w = clip((surprise / mean(surprise)) ** alpha, w_min, w_max) / mean(...)
+
+    Weighting the loss of uniform samples by p_i / mean(p) has the same expected gradient as sampling with
+    probability p_i (Fujimoto et al., "An Equivalence between Loss Functions and Non-Uniform Sampling in Experience
+    Replay", NeurIPS 2020). The floor w_min keeps low-error samples in the loss (as LAP's minimum priority does);
+    the cap w_max bounds the influence of outliers, e.g. irreducible noise.
+    """
+    w = (surprise.float() / (surprise.float().mean() + 1e-8)).pow(alpha)
+    w = w.clamp(w_min, w_max)
+    return w / w.mean()
+
+
+def pearson_corr(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    x = x - x.mean()
+    y = y - y.mean()
+    corr: torch.Tensor = (x * y).sum() / (x.norm() * y.norm() + 1e-8)
+    return corr
+
+
+@torch.no_grad()
+def compute_td_surprise(
+    actor: Network,
+    critic: Network,
+    target_critic: Network,
+    temperature: Network,
+    batch: Batch,
+    min_v: float,
+    max_v: float,
+    num_bins: int,
+    gamma: float,
+    n_step: int,
+    device: torch.device,
+    use_amp: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Score a batch for LaBER without training on it. Returns per-sample (surprise, td_abs), see `_td_surprise`.
+
+    Networks run with training=False so that scoring does not touch the BatchNorm running statistics.
+    """
+    with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
+        next_actions, info = actor(observations=batch["actor_next_observation"], training=False)
+        # Clone the actor outputs before the next compiled call (temperature) can overwrite its CUDA-graph buffers
+        next_actions = next_actions.clone()
+        next_actor_log_probs = info["log_prob"].clone()
+        next_actor_entropy = temperature() * next_actor_log_probs
+
+        next_qs, next_q_infos = target_critic(
+            observations=batch["next_observation"],
+            actions=next_actions,
+            training=False,
+        )
+        target_probs = _compute_categorical_td_target(
+            target_log_probs=_select_min_q_log_probs(next_qs, next_q_infos["log_prob"]),
+            reward=batch["reward"],  # type: ignore
+            done=batch["terminated"],  # type: ignore
+            actor_entropy=next_actor_entropy,
+            gamma=gamma**n_step,
+            num_bins=num_bins,
+            min_v=min_v,
+            max_v=max_v,
+        )
+        pred_qs, pred_q_infos = critic(
+            observations=batch["observation"],
+            actions=batch["action"],
+            training=False,
+        )
+    return _td_surprise(pred_qs, pred_q_infos["log_prob"], target_probs, min_v, max_v)
+
+
 def update_actor(
     actor: Network,
     critic: Network,
@@ -119,7 +259,8 @@ def update_actor(
             actions=actions,
             training=False,
         )
-        q = torch.minimum(qs[0], qs[1])
+        # min over the critic ensemble: clipped double Q for 2 critics, the critic itself for 1
+        q = qs.min(dim=0).values
         critic.network.requires_grad_(True)
 
         temp_value = temperature().detach()
@@ -178,15 +319,20 @@ def update_critic(
     device: torch.device,
     use_amp: bool,
     grad_scaler: Optional[GradScaler],
+    critic_target: str = "target",
+    surprise_weight_alpha: float = 0.0,
+    surprise_weight_min: float = 0.5,
+    surprise_weight_max: float = 3.0,
 ) -> dict[str, torch.Tensor]:
     """Update critic network.
 
     Args:
         actor: Actor network.
         critic: Critic network.
-        target_critic: Target critic network.
+        target_critic: Target critic network (not called when critic_target="online").
         temperature: Temperature network.
-        batch: Batch of transitions.
+        batch: Batch of transitions. An optional "weight" entry holds per-sample importance weights that
+            correct for non-uniform sampling. They weight the loss and the critics' BatchNorm statistics.
         min_v: Minimum value for categorical distribution.
         max_v: Maximum value for categorical distribution.
         num_bins: Number of bins for categorical distribution.
@@ -195,10 +341,19 @@ def update_critic(
         device: Device to use.
         use_amp: Whether to use automatic mixed precision.
         grad_scaler: GradScaler for FP16 AMP.
+        critic_target: Which networks the TD target is built from, see `_select_target_log_probs`.
+        surprise_weight_alpha: If > 0, weight each sample's loss by its surprise, see `surprise_weights`. These
+            weights only scale the loss (the batch is still uniformly sampled, so BatchNorm statistics stay unweighted)
+            and multiply any importance weights in batch["weight"].
+        surprise_weight_min, surprise_weight_max: Clip range of the surprise weights before renormalization.
     """
 
+    weights = cast(Optional[torch.Tensor], batch.get("weight"))
+    # extra arguments for the critics; empty for uniform batches, so that code path is untouched
+    critic_kwargs = {} if weights is None else {"sample_weights": torch.cat([weights, weights])}
+
     with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
-        # Compute target values
+        # Next actions and the joint [s, s'] batch
         with torch.no_grad():
             next_actions, info = actor(
                 observations=batch["actor_next_observation"],
@@ -214,16 +369,43 @@ def update_critic(
             obs_all = torch.cat([batch["observation"], batch["next_observation"]], dim=0)  # type: ignore
             act_all = torch.cat([batch["action"], next_actions], dim=0)  # type: ignore
 
-            # qs_all: (2, 2*B)
-            # q_infos_all['log_probs']: (2, 2*B, num_bins)
-            qs_all, q_infos_all = target_critic(
-                observations=obs_all,
-                actions=act_all,
-                training=True,
+        # Compute predicted q-value. This runs before the target so that the next-state half of the same
+        # joint forward pass can serve as the online estimate (CrossQ / MINTO) at no extra cost.
+        # pred_qs_all: (2, 2*B)
+        # pred_q_infos['log_probs']: (2, 2*B, num_bins)
+        pred_qs_all, pred_q_infos = critic(
+            observations=obs_all,
+            actions=act_all,
+            training=True,
+            **critic_kwargs,
+        )
+        pred_log_probs = torch.chunk(pred_q_infos["log_prob"], 2, dim=1)[0]
+
+        # Compute target values
+        with torch.no_grad():
+            # Detach and clone to prevent overwriting
+            online_next_qs = pred_qs_all.chunk(2, dim=1)[1].detach().clone()
+            online_next_log_probs = pred_q_infos["log_prob"].chunk(2, dim=1)[1].detach().clone()
+
+            target_next_qs: Optional[torch.Tensor] = None
+            target_next_log_probs: Optional[torch.Tensor] = None
+            if critic_target != "online":
+                qs_all, q_infos_all = target_critic(
+                    observations=obs_all,
+                    actions=act_all,
+                    training=True,
+                    **critic_kwargs,
+                )
+                target_next_qs = qs_all.chunk(2, dim=1)[1]
+                target_next_log_probs = q_infos_all["log_prob"].chunk(2, dim=1)[1]
+
+            next_q_log_probs, online_chosen = _select_target_log_probs(
+                critic_target,
+                online_qs=online_next_qs,
+                online_log_probs=online_next_log_probs,
+                target_qs=target_next_qs,
+                target_log_probs=target_next_log_probs,
             )
-            next_qs = qs_all.chunk(2, dim=1)[1]
-            next_q_log_probs = q_infos_all["log_prob"].chunk(2, dim=1)[1]
-            next_q_log_probs = _select_min_q_log_probs(next_qs, next_q_log_probs)
 
             # Compute target probs
             target_probs = _compute_categorical_td_target(
@@ -238,16 +420,60 @@ def update_critic(
             )
             max_entropy_bonus = next_actor_entropy.max()
 
-        # Compute predicted q-value
-        pred_qs_all, pred_q_infos = critic(
-            observations=obs_all,
-            actions=act_all,
-            training=True,
-        )
-        pred_log_probs = torch.chunk(pred_q_infos["log_prob"], 2, dim=1)[0]
+        # Per-sample errors (B,), averaged over the critics. Computed before the loss so that they can also weight it;
+        # float32 as before, when they were only diagnostics.
+        with torch.no_grad(), torch.autocast(device_type=device.type, enabled=False):
+            pred_qs = pred_qs_all.chunk(2, dim=1)[0]
+            surprise, td_abs = _td_surprise(pred_qs.detach(), pred_log_probs.detach(), target_probs, min_v, max_v)
+            sample_surprise_weights: Optional[torch.Tensor] = None
+            if surprise_weight_alpha > 0.0:
+                sample_surprise_weights = surprise_weights(
+                    surprise, surprise_weight_alpha, surprise_weight_min, surprise_weight_max
+                )
 
-        ce_loss = -(target_probs.unsqueeze(0) * pred_log_probs).sum(dim=-1)  # (2, B)
+        # importance weights of a non-uniformly sampled batch (LaBER) times surprise weights; None if neither is used
+        loss_weights = weights
+        if sample_surprise_weights is not None:
+            loss_weights = sample_surprise_weights if loss_weights is None else loss_weights * sample_surprise_weights
+
+        ce_loss = -(target_probs.unsqueeze(0) * pred_log_probs).sum(dim=-1)  # (num_qs, B)
+        if loss_weights is not None:
+            ce_loss = ce_loss * loss_weights
         critic_loss = ce_loss.mean()
+
+    # Diagnostics (computed before the gradient step)
+    with torch.no_grad():
+        ages = cast(torch.Tensor, batch["age"])
+        age_quantiles = torch.quantile(ages, torch.tensor([0.5, 0.9], device=ages.device))
+        if weights is None:
+            weights = torch.ones_like(td_abs)
+        diagnostics = {
+            # weighted means: estimates over the whole buffer when importance weights are given
+            "critic/td_abs": (td_abs * weights).mean(),
+            "critic/surprise": (surprise * weights).mean(),
+            "critic/q_mean": pred_qs.float().mean(),
+            # what the critic was actually trained on
+            "replay/batch_td_abs": td_abs.mean(),
+            "replay/batch_surprise": surprise.mean(),
+            "replay/age_mean": ages.mean(),
+            "replay/age_median": age_quantiles[0],
+            "replay/age_p90": age_quantiles[1],
+            "replay/age_max": ages.max(),
+            "replay/age_surprise_corr": pearson_corr(ages, surprise),
+        }
+        if target_next_qs is not None:
+            # staleness of the target network: |Q_target - Q_online| at (s', a'), averaged over both critics
+            diagnostics["critic_target/gap"] = (target_next_qs.float() - online_next_qs.float()).abs().mean()
+        if online_chosen is not None:
+            diagnostics["critic_target/online_frac"] = online_chosen.float().mean()
+        if sample_surprise_weights is not None:
+            w = sample_surprise_weights
+            diagnostics["critic/surprise_weight_max"] = w.max()
+            diagnostics["critic/surprise_weight_min"] = w.min()
+            # effective sample fraction (sum w)^2 / (B * sum w^2): 1 = uniform, small = few samples dominate
+            diagnostics["critic/surprise_weight_ess"] = w.sum() ** 2 / (w.numel() * w.square().sum())
+            # how prioritization relates to staleness
+            diagnostics["critic/surprise_weight_age_corr"] = pearson_corr(ages, w)
 
     # Gradient step
     assert critic.optimizer is not None
@@ -273,6 +499,7 @@ def update_critic(
         "max_entropy_bonus": max_entropy_bonus,
     }
     update_info = add_prefix_to_keys(update_info, "critic")
+    update_info.update(diagnostics)
 
     return update_info
 

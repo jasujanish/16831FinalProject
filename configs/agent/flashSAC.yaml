@@ -12,6 +12,17 @@ buffer_min_length: 10_000
 buffer_device_type: 'cuda'
 sample_batch_size: 2048
 
+# Replay sampling
+#   uniform: FlashSAC default.
+#   swd:     WarpSAC's Sample Weight Decay, p(i) ∝ max(swd_min_weight, 1 - age(i) / swd_decay_steps),
+#            with age in interaction steps.
+#   laber:   draw laber_multiplier * sample_batch_size transitions uniformly, then keep sample_batch_size
+#            of them with probability ∝ TD surprise (importance-weighted critic loss).
+sampler: 'uniform'        # ['uniform', 'swd', 'laber']
+swd_decay_steps: 2000
+swd_min_weight: 0.1
+laber_multiplier: 4
+
 normalize_reward: true
 normalized_G_max: 5.0
 
@@ -29,10 +40,29 @@ learning_rate_decay_step: ${eval:'int(${agent.learning_rate_decay_rate} *
 
 actor_num_blocks: 2
 actor_hidden_dim: 128
+# Shared actor/critic residual block:
+#   relu (default); linear_bottleneck (2x expansion, no post-projection ReLU);
+#   swiglu (SwiGLU with an approximately parameter-matched inner width).
+block_type: 'relu'
 actor_bc_alpha: 0.0
 actor_noise_zeta_mu: 2.0
 actor_noise_zeta_max: 16
+
+# Actor delay = number of critic updates per actor update.
+#   fixed: delay = actor_update_period (FlashSAC default: 2).
+#   ema:   every `interval` critic updates, with e = mean TD error over those updates,
+#          delay = clip(scale * e / EMA_beta(e), min, max).
+actor_delay: 'fixed'      # ['fixed', 'ema']
 actor_update_period: 2
+actor_delay_ema_interval: 100
+actor_delay_ema_beta: 0.9
+actor_delay_ema_scale: 2.0
+actor_delay_ema_min: 1.0
+actor_delay_ema_max: 8.0
+# What drives the actor/temperature learning-rate schedule.
+#   actor_step:  number of actor updates (FlashSAC default; the schedule then depends on the actor delay).
+#   global_step: number of critic updates (same schedule for every actor delay).
+actor_lr_schedule: 'actor_step'   # ['actor_step', 'global_step']
 
 critic_num_blocks: 2
 critic_hidden_dim: 256
@@ -40,6 +70,23 @@ critic_num_bins: 101
 critic_min_v: ${eval:'-${agent.normalized_G_max}'}
 critic_max_v: ${eval:'${agent.normalized_G_max}'}
 critic_target_update_tau: 0.01
+# Networks the TD target is built from (each option keeps the lowest-Q distribution among its candidates).
+#   target:    FlashSAC default. The 2 target critics (clipped double Q).
+#   online:    CrossQ-style, no target network: the 2 online critics, gradient stopped. No Polyak update.
+#   minto:     MINTO: the 2 target and the 2 online critics.
+#   minto_net: MINTO between networks: the mean of the 2 target critics vs. the mean of the 2 online critics.
+critic_target: 'target'   # ['target', 'online', 'minto', 'minto_net']
+# Number of critics in the ensemble. With 1 there is no clipped double Q: the TD target and the actor
+# objective use the single critic (the "min" over one critic is the critic itself).
+critic_num_qs: 2
+# In-batch surprise weighting of the critic loss (0 = off). Each sample's cross-entropy is weighted by
+#   w = clip((surprise / batch-mean surprise) ** alpha, min, max), renormalized to mean 1,
+# where surprise = ||softmax(logits) - target_probs||_2, averaged over the critics. With uniform sampling this has the
+# expected gradient of prioritized replay without importance correction (Fujimoto et al., NeurIPS 2020), using
+# priorities computed fresh on every batch. BatchNorm statistics and the actor update are not weighted.
+critic_surprise_weight_alpha: 0.0
+critic_surprise_weight_min: 0.5
+critic_surprise_weight_max: 3.0
 
 temp_initial_value: 0.01
 temp_target_sigma: 0.15
