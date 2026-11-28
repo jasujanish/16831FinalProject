@@ -16,6 +16,7 @@ from flash_rl.agents.flashSAC.network import (
     FlashSACTemperature,
 )
 from flash_rl.agents.flashSAC.update import (
+    CRITIC_TARGETS,
     compute_td_surprise,
     pearson_corr,
     update_actor,
@@ -63,6 +64,7 @@ class FlashSACConfig:
 
     actor_num_blocks: int
     actor_hidden_dim: int
+    block_type: str
     actor_bc_alpha: float
     actor_noise_zeta_mu: float
     actor_noise_zeta_max: int
@@ -81,6 +83,11 @@ class FlashSACConfig:
     critic_min_v: float
     critic_max_v: float
     critic_target_update_tau: float
+    critic_target: str  # 'target' | 'online' | 'minto' | 'minto_net'
+    critic_num_qs: int
+    critic_surprise_weight_alpha: float
+    critic_surprise_weight_min: float
+    critic_surprise_weight_max: float
 
     temp_initial_value: float
     temp_target_sigma: float
@@ -133,6 +140,7 @@ def _init_flashsac_networks(
         input_dim=actor_observation_dim,
         hidden_dim=cfg.actor_hidden_dim,
         action_dim=action_dim,
+        block_type=cfg.block_type,
     ).to(device)
 
     use_fused = device.type == "cuda" and torch.cuda.is_available()
@@ -158,6 +166,8 @@ def _init_flashsac_networks(
         num_bins=cfg.critic_num_bins,
         min_v=cfg.critic_min_v,
         max_v=cfg.critic_max_v,
+        num_qs=cfg.critic_num_qs,
+        block_type=cfg.block_type,
     ).to(device)
 
     critic_optimizer = optim.Adam(
@@ -186,6 +196,8 @@ def _init_flashsac_networks(
         num_bins=cfg.critic_num_bins,
         min_v=cfg.critic_min_v,
         max_v=cfg.critic_max_v,
+        num_qs=cfg.critic_num_qs,
+        block_type=cfg.block_type,
     ).to(device)
     target_critic_net.load_state_dict(critic_net.state_dict())
     target_critic = Network(
@@ -334,11 +346,18 @@ def _update_networks(
         device=device,
         use_amp=cfg.use_amp,
         grad_scaler=grad_scaler,
+        critic_target=cfg.critic_target,
+        surprise_weight_alpha=cfg.critic_surprise_weight_alpha,
+        surprise_weight_min=cfg.critic_surprise_weight_min,
+        surprise_weight_max=cfg.critic_surprise_weight_max,
     )
 
-    target_critic_info = update_target_network(
-        target_network=target_critic,
-    )
+    # without a target network (CrossQ-style) the target critic is unused and keeps its initial weights
+    target_critic_info: dict[str, torch.Tensor] = {}
+    if cfg.critic_target != "online":
+        target_critic_info = update_target_network(
+            target_network=target_critic,
+        )
 
     # Merge all info dicts
     update_info = {
@@ -375,6 +394,11 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
 
         self._critic_observation_dim: int = observation_space.shape[-1]  # type: ignore
         self._action_dim: int = action_space.shape[-1]  # type: ignore
+        if env_info.get("asymmetric_obs", False) and not cfg.asymmetric_observation:
+            raise ValueError(
+                "The env returns [actor obs, privileged critic obs]; set agent.asymmetric_observation=true, "
+                "otherwise the actor would be trained on the privileged observations."
+            )
         if cfg.asymmetric_observation:
             self._actor_observation_dim = env_info["actor_observation_size"][-1]
         else:
@@ -402,6 +426,12 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
 
         assert cfg.sampler in ("uniform", "swd", "laber", "window"), f"Unknown sampler: {cfg.sampler}"
         assert cfg.actor_lr_schedule in ("actor_step", "global_step")
+        assert cfg.critic_target in CRITIC_TARGETS, f"Unknown critic target: {cfg.critic_target}"
+        # LaBER's scoring (`compute_td_surprise`) always builds its targets from the target network
+        assert cfg.sampler != "laber" or cfg.critic_target == "target", "LaBER requires critic_target='target'"
+        assert cfg.critic_num_qs >= 1, f"critic_num_qs must be >= 1, got {cfg.critic_num_qs}"
+        assert cfg.critic_surprise_weight_alpha >= 0.0
+        assert 0.0 < cfg.critic_surprise_weight_min <= 1.0 <= cfg.critic_surprise_weight_max
         self._update_step = 0
         self._lr_schedule = _make_lr_schedule(cfg)
         self._actor_delay = ActorDelay(
@@ -645,6 +675,9 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
 
     def save(self, path: str) -> None:
         os.makedirs(path, exist_ok=True)
+        if self._cfg.critic_target == "online":
+            # the unused target critic still holds its initial weights; save what `online` bootstraps from instead
+            self._target_critic.network.load_state_dict(self._critic.network.state_dict())
         self._actor.save(os.path.join(path, "actor.pt"))
         self._critic.save(os.path.join(path, "critic.pt"))
         self._target_critic.save(os.path.join(path, "target_critic.pt"))

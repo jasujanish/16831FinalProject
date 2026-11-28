@@ -1,11 +1,14 @@
 """
-CPU tests for the project extensions (SWD / LaBER sampling, adaptive actor delay, logging).
+CPU tests for the project extensions (SWD / LaBER sampling, adaptive actor delay, critic targets, single critic,
+in-batch surprise weighting, logging).
 
     python -m pytest tests/test_extensions.py
 """
 
 import csv
 import os
+from dataclasses import dataclass, field
+from types import SimpleNamespace
 
 os.environ.setdefault("TORCH_COMPILE_DISABLE", "1")  # no compiler needed for the tests
 
@@ -19,6 +22,8 @@ from omegaconf import OmegaConf
 from flash_rl.agents import create_agent
 from flash_rl.agents.flashSAC.actor_delay import ActorDelay
 from flash_rl.agents.flashSAC.layer import EnsembleUnitBatchNorm
+from flash_rl.agents.flashSAC.network import FlashSACDoubleCritic
+from flash_rl.agents.flashSAC.update import CRITIC_TARGETS, _select_target_log_probs, surprise_weights
 from flash_rl.buffers.torch_buffer import TorchUniformBuffer
 from flash_rl.common.logger import CsvTrainerLogger
 
@@ -57,7 +62,7 @@ def make_buffer(max_length: int, **kwargs) -> TorchUniformBuffer:
     )
 
 
-def make_agent(*overrides: str):
+def make_agent(*overrides: str, env_info=None):
     with hydra.initialize(version_base=None, config_path="../configs"):
         cfg = hydra.compose(
             "flashSAC_base",
@@ -73,7 +78,7 @@ def make_agent(*overrides: str):
             ],
         )
     OmegaConf.resolve(cfg)
-    agent = create_agent(OBS_SPACE, ACTION_SPACE, {}, cfg.agent)
+    agent = create_agent(OBS_SPACE, ACTION_SPACE, dict(env_info or {}), cfg.agent)
     for step in range(100):
         agent.process_transition(make_transition(step))
     return agent
@@ -283,6 +288,179 @@ def test_weighted_batchnorm_recovers_uniform_statistics() -> None:
     assert torch.allclose(norm(batch, training=True, sample_weights=torch.ones(4096)), out, atol=1e-4)
 
 
+def test_select_target_log_probs() -> None:
+    torch.manual_seed(0)
+    num_bins, batch_size = 11, 512
+    bins = torch.linspace(-1, 1, num_bins)
+
+    def random_critics():
+        log_probs = torch.log_softmax(3 * torch.randn(2, batch_size, num_bins), dim=-1)
+        return (log_probs.exp() * bins).sum(-1), log_probs  # Q = mean of the distribution
+
+    online_qs, online_lp = random_critics()
+    target_qs, target_lp = random_critics()
+
+    def q_of(log_probs):
+        return (log_probs.exp() * bins).sum(-1)
+
+    selected = {}
+    for mode in CRITIC_TARGETS:
+        log_probs, online_chosen = _select_target_log_probs(mode, online_qs, online_lp, target_qs, target_lp)
+        assert log_probs.shape == (batch_size, num_bins)
+        assert torch.allclose(log_probs.exp().sum(-1), torch.ones(batch_size), atol=1e-5)
+        assert (online_chosen is not None) == mode.startswith("minto")
+        selected[mode] = q_of(log_probs)
+
+    assert torch.allclose(selected["target"], target_qs.min(0).values, atol=1e-5)
+    assert torch.allclose(selected["online"], online_qs.min(0).values, atol=1e-5)
+    # MINTO: never above the target-network estimate, and lower wherever an online critic is lower
+    assert torch.allclose(selected["minto"], torch.minimum(target_qs.min(0).values, online_qs.min(0).values), atol=1e-5)
+    assert (selected["minto"] <= selected["target"] + 1e-6).all()
+    assert torch.allclose(selected["minto_net"], torch.minimum(target_qs.mean(0), online_qs.mean(0)), atol=1e-5)
+    # online-chosen flags match the comparison
+    _, online_chosen = _select_target_log_probs("minto_net", online_qs, online_lp, target_qs, target_lp)
+    assert torch.equal(online_chosen, online_qs.mean(0) < target_qs.mean(0))
+    # online mode does not need the target network
+    log_probs, _ = _select_target_log_probs("online", online_qs, online_lp, None, None)
+    assert torch.allclose(q_of(log_probs), selected["online"])
+
+
+def test_critic_targets_agree_when_target_equals_online() -> None:
+    # at initialization the target critic is a copy of the critic, so target / online / minto yield the
+    # same update. minto_net does not: it averages the 2 critics instead of taking their minimum.
+    losses = {}
+    for mode in CRITIC_TARGETS:
+        torch.manual_seed(0)
+        agent = make_agent(f"agent.critic_target={mode}")
+        losses[mode] = agent.update()["critic/loss"]
+    for mode in ("online", "minto"):
+        assert losses[mode] == pytest.approx(losses["target"], rel=1e-6), losses
+    assert losses["minto_net"] != pytest.approx(losses["target"], rel=1e-6), losses
+
+
+@pytest.mark.parametrize("critic_target", CRITIC_TARGETS)
+def test_critic_target_update(critic_target: str) -> None:
+    agent = make_agent(f"agent.critic_target={critic_target}")
+    target_before = [p.detach().clone() for p in agent._target_critic.network.parameters()]
+    infos = [agent.update() for _ in range(20)]
+    for info in infos:
+        assert all(np.isfinite(v) for v in info.values()), info
+    info = infos[-1]
+    assert ("critic_target/gap" in info) == (critic_target != "online")
+    assert ("critic_target/online_frac" in info) == critic_target.startswith("minto")
+    if critic_target.startswith("minto"):
+        assert 0.0 <= info["critic_target/online_frac"] <= 1.0
+    # the target network is frozen (and unused) without Polyak updates, and moves otherwise
+    target_after = list(agent._target_critic.network.parameters())
+    unchanged = all(torch.equal(a, b) for a, b in zip(target_before, target_after))
+    assert unchanged == (critic_target == "online")
+
+
+def test_online_checkpoint_saves_current_critic_as_target(tmp_path) -> None:
+    agent = make_agent("agent.critic_target=online")
+    for _ in range(5):
+        agent.update()
+    agent.save(str(tmp_path))
+    saved_critic = torch.load(tmp_path / "critic.pt")["network_state_dict"]
+    saved_target = torch.load(tmp_path / "target_critic.pt")["network_state_dict"]
+    assert saved_critic.keys() == saved_target.keys()
+    assert all(torch.equal(saved_critic[k], saved_target[k]) for k in saved_critic)
+
+
+def test_laber_requires_target_network() -> None:
+    with pytest.raises(AssertionError, match="LaBER"):
+        make_agent("agent.sampler=laber", "agent.critic_target=minto")
+
+
+def num_params(network) -> int:
+    return sum(p.numel() for p in network.parameters())
+
+
+@pytest.mark.parametrize("critic_target", ["online", "target"])
+def test_single_critic(critic_target: str) -> None:
+    pair = make_agent(f"agent.critic_target={critic_target}")
+    single = make_agent(f"agent.critic_target={critic_target}", "agent.critic_num_qs=1")
+    assert single._critic.network.num_qs == 1 and single._target_critic.network.num_qs == 1
+    # one critic of the same shape has half the parameters of the pair
+    assert num_params(single._critic.network) * 2 == num_params(pair._critic.network)
+    infos = [single.update() for _ in range(20)]
+    for info in infos:
+        assert all(np.isfinite(v) for v in info.values()), info
+    assert sum("actor/loss" in i for i in infos) == 10
+
+
+def test_single_wider_critic_matches_pair_size() -> None:
+    # Run 2: one critic at width 360 has about as many parameters as the default pair at width 256
+    with hydra.initialize(version_base=None, config_path="../configs"):
+        cfg = hydra.compose("flashSAC_base")
+    critic_input_dim = 310 + 37  # Rough-G1: observation + action
+    pair = FlashSACDoubleCritic(cfg.agent.critic_num_blocks, critic_input_dim, 256, 101, -5.0, 5.0, num_qs=2)
+    single = FlashSACDoubleCritic(cfg.agent.critic_num_blocks, critic_input_dim, 360, 101, -5.0, 5.0, num_qs=1)
+    assert num_params(single) == pytest.approx(num_params(pair), rel=0.05)
+
+
+def test_surprise_weights() -> None:
+    torch.manual_seed(0)
+    surprise = torch.rand(4096).exp()
+    w = surprise_weights(surprise, alpha=0.5, w_min=0.5, w_max=3.0)
+    assert w.shape == surprise.shape
+    assert float(w.mean()) == pytest.approx(1.0, abs=1e-5)
+    # monotone in surprise, and close to the clip range (the renormalization shifts it slightly)
+    order = surprise.argsort()
+    assert (w[order].diff() >= -1e-6).all()
+    assert 0.4 < float(w.min()) and float(w.max()) < 3.5
+    # alpha = 0 gives uniform weights; alpha = 1 with a wide clip range gives weights proportional to surprise
+    assert torch.allclose(surprise_weights(surprise, 0.0, 0.5, 3.0), torch.ones(4096))
+    w1 = surprise_weights(surprise, 1.0, 1e-6, 1e6)
+    assert torch.allclose(w1, surprise / surprise.mean(), atol=1e-5)
+
+
+def test_surprise_weighting_only_changes_the_loss() -> None:
+    # same seed and batch: identical forward pass and errors, different loss
+    infos = {}
+    for alpha in (0.0, 0.5):
+        torch.manual_seed(0)
+        agent = make_agent("agent.critic_target=online", f"agent.critic_surprise_weight_alpha={alpha}")
+        torch.manual_seed(1)
+        infos[alpha] = agent.update()
+    off, on = infos[0.0], infos[0.5]
+    assert on["critic/td_abs"] == pytest.approx(off["critic/td_abs"], rel=1e-6)
+    assert on["critic/surprise"] == pytest.approx(off["critic/surprise"], rel=1e-6)
+    assert on["critic/loss"] != pytest.approx(off["critic/loss"], rel=1e-6)
+    assert "critic/surprise_weight_ess" not in off
+    assert 0.0 < on["critic/surprise_weight_ess"] <= 1.0
+    assert 0.4 < on["critic/surprise_weight_min"] <= 1.0 <= on["critic/surprise_weight_max"] < 3.5
+
+
+@pytest.mark.parametrize("num_qs, hidden_dim", [(2, 256), (1, 360)])
+def test_surprise_weighting_runs(num_qs: int, hidden_dim: int) -> None:
+    # Runs 3 and 4: surprise weighting on the default pair and on one wider critic, without a target network
+    agent = make_agent(
+        "agent.critic_target=online",
+        "agent.critic_surprise_weight_alpha=0.5",
+        f"agent.critic_num_qs={num_qs}",
+        f"agent.critic_hidden_dim={hidden_dim}",
+    )
+    infos = [agent.update() for _ in range(20)]
+    for info in infos:
+        assert all(np.isfinite(v) for v in info.values()), info
+    assert "critic/surprise_weight_age_corr" in infos[-1]
+
+
+def test_surprise_weighting_combines_with_laber() -> None:
+    agent = make_agent("agent.sampler=laber", "agent.critic_surprise_weight_alpha=0.5")
+    infos = [agent.update() for _ in range(10)]
+    for info in infos:
+        assert all(np.isfinite(v) for v in info.values()), info
+
+
+def test_invalid_critic_options() -> None:
+    with pytest.raises(AssertionError, match="critic_num_qs"):
+        make_agent("agent.critic_num_qs=0")
+    with pytest.raises(AssertionError):
+        make_agent("agent.critic_surprise_weight_min=2.0")
+
+
 def test_buffer_save_load(tmp_path) -> None:
     buffer = make_buffer(1000, sampler="swd")
     for step in range(50):
@@ -361,3 +539,74 @@ def test_csv_logger(tmp_path, monkeypatch) -> None:
     assert [r["a"] for r in rows] == ["1.0", "2.0", "3.0", ""]
     assert [r["b"] for r in rows] == ["", "", "4.0", "5.0"]
     assert os.path.exists(os.path.join(logger.log_dir, "config.yaml"))
+
+
+def test_privileged_critic_group() -> None:
+    """The critic group is a noise-free copy of the policy group; the policy group is left untouched."""
+    from flash_rl.envs.isaaclab import add_privileged_critic_group  # imports no IsaacLab module at import time
+
+    @dataclass
+    class Term:
+        noise: object = "noise"
+
+    @dataclass
+    class Group:
+        enable_corruption: bool = True
+        concatenate_terms: bool = True
+        joint_vel: Term = field(default_factory=Term)
+        height_scan: object = None  # flat tasks remove this term
+
+    env_cfg = SimpleNamespace(observations=SimpleNamespace(policy=Group()))
+    add_privileged_critic_group(env_cfg)
+    policy, critic = env_cfg.observations.policy, env_cfg.observations.critic
+    assert policy.enable_corruption and not critic.enable_corruption
+    assert critic is not policy and critic.joint_vel is not policy.joint_vel
+    assert critic.height_scan is None and critic.concatenate_terms
+    with pytest.raises(ValueError):
+        add_privileged_critic_group(env_cfg)
+
+
+def test_asymmetric_actor_ignores_critic_observation() -> None:
+    """With asymmetric observations the actor uses only the first `actor_observation_size` entries."""
+    actor_dim = 3
+    agent = make_agent("agent.asymmetric_observation=true", env_info={"actor_observation_size": (actor_dim,)})
+    rng = np.random.default_rng(0)
+    obs = rng.normal(size=(NUM_ENVS, OBS_DIM)).astype(np.float32)
+    other = obs.copy()
+    other[:, actor_dim:] = rng.normal(size=(NUM_ENVS, OBS_DIM - actor_dim))
+    a1 = agent.sample_actions(0, {"next_observation": obs}, training=False)
+    a2 = agent.sample_actions(0, {"next_observation": other}, training=False)
+    np.testing.assert_allclose(a1, a2)
+    other[:, :actor_dim] += 1.0
+    a3 = agent.sample_actions(0, {"next_observation": other}, training=False)
+    assert not np.allclose(a1, a3)
+    infos = [agent.update() for _ in range(6)]
+    assert all(np.isfinite(v) for i in infos for v in i.values())
+
+
+def test_privileged_env_requires_asymmetric_agent() -> None:
+    """Without the asymmetric flag the actor would read the privileged observations: refuse to build the agent."""
+    with pytest.raises(ValueError, match="asymmetric_observation"):
+        make_agent(env_info={"actor_observation_size": (3,), "asymmetric_obs": True})
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        # the three asymmetric group-plan runs: Online, 1 critic, 1 wide critic, each with the asymmetric critic
+        ("agent.critic_target=online",),
+        ("agent.critic_target=online", "agent.critic_num_qs=1"),
+        ("agent.critic_target=online", "agent.critic_num_qs=1", "agent.critic_hidden_dim=360"),
+        # Rafay's block architectures on top of the single wide critic
+        ("agent.critic_target=online", "agent.critic_num_qs=1", "agent.block_type=swiglu"),
+        ("agent.critic_target=target", "agent.block_type=linear_bottleneck"),
+    ],
+)
+def test_merged_options_combine(overrides: tuple[str, ...]) -> None:
+    """Asymmetric critic (privileged-critic), block types (arch-variants) and the Online / single-critic options
+    (Nish) build and update together."""
+    actor_dim = 3
+    agent = make_agent("agent.asymmetric_observation=true", *overrides,
+                       env_info={"actor_observation_size": (actor_dim,), "asymmetric_obs": True})
+    infos = [agent.update() for _ in range(6)]
+    assert all(np.isfinite(v) for i in infos for v in i.values())

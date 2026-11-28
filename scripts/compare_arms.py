@@ -1,6 +1,7 @@
 """
-Compare replay-window arms on G1: 10M baseline (uniform_d2), fixed 1M buffer (buffer_1M), growing window (window_1to10M).
-Reads results/ours/<exp>_eval.csv (written by scripts/compare_baseline.py, in git), so it runs without the raw logs.
+Compare replay-window arms on G1: 10M baseline, fixed 1M buffer (buffer_1M), growing window (window_1to10M).
+Reads <results_dir>/<method>/<task>/<run>/metrics.csv (the layout of logs/<group>/ and scripts/plot_results.py).
+All 18 runs (3 arms x 2 tasks x 3 seeds) ran on one g6e.xlarge (L40S); the baseline here is our own uniform_d2 sweep.
 
 Metrics per run (normalized AUC = mean return over the range, trapezoid rule; env_step is the logging step):
   AUC 0-15M      window_1to10M runs the same algorithm as buffer_1M here
@@ -11,10 +12,11 @@ Writes <out_dir>/three_arm_stats.csv (Welch t per task and pair) and three_arm_G
 tasks of the relative differences (normal approximation; with 3 seeds per arm its CIs are a little too narrow).
 No correction for multiple comparisons.
 
-usage: python scripts/compare_arms.py [--out_dir results/ours]
+usage: python scripts/compare_arms.py [--results_dir results/jaehoon] [--out_dir results/jaehoon/plots]
 """
 
 import argparse
+import glob
 import os
 
 import numpy as np
@@ -22,7 +24,7 @@ import pandas as pd
 from scipy import stats
 
 ARMS = {  # key: (exp_name, label, color, linestyle, sampled window in M as a function of env steps in M)
-    "B": ("uniform_d2", "10M buffer (baseline)", "#8a8984", "--", lambda x: np.minimum(x, 10)),
+    "B": ("baseline", "10M buffer (baseline)", "#8a8984", "--", lambda x: np.minimum(x, 10)),
     "1M": ("buffer_1M", "1M buffer", "#eb6834", "-", lambda x: np.minimum(x, 1)),
     "W": ("window_1to10M", "growing window 1M→10M", "#2a78d6", "-",
           lambda x: np.minimum(x, np.clip(1 + (x - 15) * 9 / 15, 1, 10))),
@@ -58,15 +60,22 @@ def welch(a, b):
     return d, d - h, d + h, 2 * stats.t.sf(abs(d / se), df), se
 
 
-def load(out_dir: str) -> dict:
+def load_curve(path: str) -> tuple[np.ndarray, np.ndarray]:
+    """Eval curve of one run on the logging-step axis (`env_step`), as in scripts/compare_baseline.py."""
+    df = pd.read_csv(path)
+    e = df[df["avg_return"].notna()][["env_step", "avg_return"]]
+    e = e.drop_duplicates("env_step", keep="last").sort_values("env_step")
+    return e.env_step.values.astype(float), e.avg_return.values
+
+
+def load(results_dir: str) -> dict:
     """(task, arm) -> list of (steps, returns), one per seed; checks 3 complete seeds on a shared step grid."""
     runs = {}
-    for arm, (exp, *_) in ARMS.items():
-        df = pd.read_csv(os.path.join(out_dir, f"{exp}_eval.csv"))
+    for arm, (method, *_) in ARMS.items():
         for task in TASKS:
-            g = df[(df.env_name == task) & (df.metric == "avg_return")]
-            R = [(x.env_step.values.astype(float), x.value.values) for _, x in g.sort_values("env_step").groupby("seed")]
-            assert len(R) == 3 and all(s[-1] == FINAL_STEP for s, _ in R), (task, exp, len(R))
+            paths = sorted(glob.glob(os.path.join(results_dir, method, task, "seed*", "metrics.csv")))
+            R = [load_curve(p) for p in paths]
+            assert len(R) == 3 and all(s[-1] == FINAL_STEP for s, _ in R), (task, method, len(R))
             runs[task, arm] = R
     for task in TASKS:
         s0 = runs[task, "B"][0][0]
@@ -76,9 +85,11 @@ def load(out_dir: str) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--out_dir", default="results/ours")
+    parser.add_argument("--results_dir", default="results/jaehoon")
+    parser.add_argument("--out_dir", default="results/jaehoon/plots")
     args = parser.parse_args()
-    runs = load(args.out_dir)
+    os.makedirs(args.out_dir, exist_ok=True)
+    runs = load(args.results_dir)
 
     rows, rel = [], {(k, x, y): [] for k in METRICS for x, y in PAIRS}
     for task in TASKS:

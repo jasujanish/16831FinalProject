@@ -8,6 +8,16 @@ import torch.nn.functional as F
 from flash_rl.agents.utils.distribution import safe_tanh_log_det_jacobian
 
 
+def _block_dimensions(hidden_dim: int, block_type: str) -> tuple[int, bool, bool]:
+    if block_type == "relu":
+        return hidden_dim * 4, False, True
+    if block_type == "linear_bottleneck":
+        return hidden_dim * 2, False, False
+    if block_type == "swiglu":
+        return max(1, round(hidden_dim * 8 / 3)), True, True
+    raise ValueError(f"Unknown FlashSAC block type: {block_type}")
+
+
 class UnitLinear(nn.Module):
     def __init__(self, input_dim: int, output_dim: int):
         super().__init__()
@@ -90,21 +100,29 @@ class FlashSACEmbedder(nn.Module):
 
 
 class FlashSACBlock(nn.Module):
-    def __init__(self, hidden_dim: int, expansion: int = 4):
+    def __init__(self, hidden_dim: int, block_type: str = "relu"):
         super().__init__()
-        self.w1 = UnitLinear(hidden_dim, hidden_dim * expansion)
-        self.w2 = UnitLinear(hidden_dim * expansion, hidden_dim)
-        self.norm1 = UnitBatchNorm(hidden_dim * expansion)
+        inner_dim, gated, post_activation = _block_dimensions(hidden_dim, block_type)
+        self.w1 = UnitLinear(hidden_dim, inner_dim * (2 if gated else 1))
+        self.w2 = UnitLinear(inner_dim, hidden_dim)
+        self.norm1 = UnitBatchNorm(inner_dim * (2 if gated else 1))
         self.norm2 = UnitBatchNorm(hidden_dim)
+        self.gated = gated
+        self.post_activation = post_activation
 
     def forward(self, x: torch.Tensor, training: bool) -> torch.Tensor:
         residual = x
         x = self.w1(x)
         x = self.norm1(x, training=training)
-        x = F.relu(x)
+        if self.gated:
+            gate, value = x.chunk(2, dim=-1)
+            x = F.silu(gate) * value
+        else:
+            x = F.relu(x)
         x = self.w2(x)
         x = self.norm2(x, training=training)
-        x = F.relu(x)
+        if self.post_activation:
+            x = F.relu(x)
         x = x + residual
         return x
 
@@ -261,21 +279,29 @@ class EnsembleFlashSACEmbedder(nn.Module):
 
 
 class EnsembleFlashSACBlock(nn.Module):
-    def __init__(self, num_ensemble: int, hidden_dim: int, expansion: int = 4):
+    def __init__(self, num_ensemble: int, hidden_dim: int, block_type: str = "relu"):
         super().__init__()
-        self.w1 = EnsembleUnitLinear(num_ensemble, hidden_dim, hidden_dim * expansion)
-        self.w2 = EnsembleUnitLinear(num_ensemble, hidden_dim * expansion, hidden_dim)
-        self.norm1 = EnsembleUnitBatchNorm(num_ensemble, hidden_dim * expansion)
+        inner_dim, gated, post_activation = _block_dimensions(hidden_dim, block_type)
+        self.w1 = EnsembleUnitLinear(num_ensemble, hidden_dim, inner_dim * (2 if gated else 1))
+        self.w2 = EnsembleUnitLinear(num_ensemble, inner_dim, hidden_dim)
+        self.norm1 = EnsembleUnitBatchNorm(num_ensemble, inner_dim * (2 if gated else 1))
         self.norm2 = EnsembleUnitBatchNorm(num_ensemble, hidden_dim)
+        self.gated = gated
+        self.post_activation = post_activation
 
     def forward(self, x: torch.Tensor, training: bool, sample_weights: Optional[torch.Tensor] = None) -> torch.Tensor:
         residual = x
         x = self.w1(x)
         x = self.norm1(x, training=training, sample_weights=sample_weights)
-        x = F.relu(x)
+        if self.gated:
+            gate, value = x.chunk(2, dim=-1)
+            x = F.silu(gate) * value
+        else:
+            x = F.relu(x)
         x = self.w2(x)
         x = self.norm2(x, training=training, sample_weights=sample_weights)
-        x = F.relu(x)
+        if self.post_activation:
+            x = F.relu(x)
         x = x + residual
         return x
 

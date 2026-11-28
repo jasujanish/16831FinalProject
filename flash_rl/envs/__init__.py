@@ -89,6 +89,7 @@ def create_envs(
             env_name=env_name,
             num_envs=num_train_envs,
             seed=seed,
+            privileged_critic=bool(kwargs.get("privileged_critic", False)),
         )
         # NOTE: IsaacLab/IsaacSim only supports one SimulationApp instance per process by design.
         # See https://github.com/isaac-sim/IsaacLab/discussions/1241

@@ -19,6 +19,12 @@ All keys live in `configs/agent/flashSAC.yaml` and are set with `--overrides age
 | `actor_delay_ema_scale` | `2.0` | Delay when the TD error equals its EMA |
 | `actor_delay_ema_min` / `_max` | `1.0` / `8.0` | Clip range of the delay |
 | `actor_lr_schedule` | `actor_step`, `global_step` | What drives the actor/temperature learning-rate schedule |
+| `critic_target` | `target`, `online`, `minto`, `minto_net` | Which networks the TD target is built from |
+| `critic_num_qs` | `2` | Critics in the ensemble. `1` = a single critic, no clipped double Q |
+| `critic_surprise_weight_alpha` | `0.0` | In-batch surprise weighting of the critic loss (`0` = off) |
+| `critic_surprise_weight_min` / `_max` | `0.5` / `3.0` | Clip range of the surprise weights |
+| `block_type` | `relu`, `linear_bottleneck`, `swiglu` | Residual block of the actor and critic (Rafay's arch variants): FlashSAC's 4× ReLU block; 2× expansion without the ReLU after the block; gated SiLU with ≈ the same parameters |
+| `asymmetric_observation` | `false`, `true` | The critic also reads the env's privileged observations (use with `env.privileged_critic=true`) |
 
 `log_csv` (default `true`, in `configs/flashSAC_base.yaml`) turns the CSV log on or off.
 
@@ -52,11 +58,72 @@ The delay is real-valued: each critic update earns `1/delay` credit and an actor
 schedule depends on the delay. `actor_lr_schedule=global_step` ties it to the number of critic updates instead. Use it
 for all runs of a delay comparison (it also changes the `d=2` baseline).
 
+**Critic targets** (`_select_target_log_probs` in `flash_rl/agents/flashSAC/update.py`). Every option keeps the
+next-state return distribution with the lowest Q (the mean of the distribution) among its candidates, then builds the
+categorical TD target from it as before. The online candidates are the next-state half of the critic's own joint
+`[s, s']` forward pass, gradient stopped, so they cost no extra forward pass.
+
+| Option | Candidates | Notes |
+|---|---|---|
+| `target` | the 2 target critics | FlashSAC (clipped double Q) |
+| `online` | the 2 online critics | CrossQ-style: no target network. The target critic is neither called nor Polyak-updated; checkpoints save the current critic as `target_critic.pt` |
+| `minto` | the 2 target + the 2 online critics | MINTO ([Hendawy et al.](https://arxiv.org/abs/2510.02590)); never above `target` |
+| `minto_net` | mean of the 2 target critics vs. mean of the 2 online critics | MINTO without clipped double Q: all pessimism comes from the online-vs-target minimum |
+
+The actor objective is unchanged (`min` over the online critics).
+
+**Single critic** (`critic_num_qs=1`). The critic ensemble has one member instead of two, for the critic and the target
+critic alike. The `min` over critics in the TD target and the actor objective is then the critic itself, so there is no
+clipped double Q. With the same width the critic has half the parameters of the default pair; `critic_hidden_dim=360`
+gives about the same number of parameters as the pair at width 256 (2.18M vs 2.24M on Flat-G1, 2.24M vs 2.34M on
+Rough-G1). The default `critic_num_qs=2` reproduces the previous updates exactly.
+
+**In-batch surprise weighting** (`critic_surprise_weight_alpha > 0`, `surprise_weights` in
+`flash_rl/agents/flashSAC/update.py`). The batch is still sampled uniformly. Each sample's cross-entropy is weighted by
+
+    w = clip((surprise / mean surprise) ** alpha, min, max), renormalized to mean 1 over the batch
+
+with `surprise` as above, computed from the same forward pass as the loss (no extra network call). Weighting the loss of
+uniform samples by `p_i / mean(p)` has the same expected gradient as sampling with probability `p_i` (Fujimoto, Meger &
+Precup, "An Equivalence between Loss Functions and Non-Uniform Sampling in Experience Replay", NeurIPS 2020), so this is
+prioritized replay without importance correction, with priorities that are fresh on every batch. Unlike LaBER, which
+corrects its selection with importance weights and so keeps the uniform expected gradient, this deliberately changes it.
+The weights scale only the critic loss: BatchNorm statistics (the batch is uniform) and the actor update are unchanged.
+Under LaBER they multiply its importance weights. LaBER scoring always uses the target network, so
+`sampler=laber` requires `critic_target=target`. The online pass now runs before the target pass, which does not change
+the `target` results (the two networks share no state).
+
 ## Running
 
-    scripts/run_humanoid.sh <exp_name> [agent overrides...]
+    scripts/run_humanoid.sh <exp_name> [--asym] [--block relu|linear_bottleneck|swiglu] [overrides...]
 
-runs the four IsaacLab humanoid tasks for each seed; see the examples at the top of the script.
+runs the four IsaacLab humanoid tasks for each seed; see the examples at the top of the script. `--block B` sets
+`agent.block_type=B` for the actor and critic. Flags and overrides can be mixed in any order.
+
+To make runs comparable with ours (machine, setup, exact commands, memory, smoke tests, what to send
+back, plotting), follow `STEPS.md`. One check it does not cover: diff the first run's `config.yaml` against the
+`results/nish` run of the same method without `_asym`. Only `exp_name`, `seed`, `save_path`, `env.privileged_critic`,
+`agent.asymmetric_observation` (and `agent.buffer_device_type`, if set) may differ.
+
+## Privileged critic (IsaacLab)
+
+IsaacLab adds noise to the policy observations (joint velocities ±1.5, base angular velocity ±0.2, height scan ±0.1,
+...). `env.privileged_critic=true` adds a `critic` observation group, a copy of the policy terms with the noise turned
+off (`add_privileged_critic_group` in `flash_rl/envs/isaaclab.py`). The env then returns `[policy obs, critic obs]`;
+with `agent.asymmetric_observation=true` the actor reads only the first (noisy) part and the critic reads both, so the
+trained policy takes the same inputs as before.
+
+`--asym` sets both keys (see `STEPS.md` for the commands and the memory each task needs).
+
+- The agent refuses to start with `env.privileged_critic=true` alone, because the actor would then be
+  trained on the noise-free observations.
+- `play_isaaclab.py` needs the same two overrides to load a checkpoint trained this way.
+- Before this change `agent.asymmetric_observation=true` had no effect on IsaacLab tasks: the check for a `critic`
+  group was always false, and the combined observation shape was built by concatenating two shape tuples.
+- A task that already defines its own `critic` group is not supported yet (`privileged_critic=true` raises).
+
+H1, 3 seeds, 50M steps, final return (mean ± s.e.) against `uniform_d2`: Flat-H1 40.04 ± 0.34 vs. 38.72 ± 0.59,
+Rough-H1 31.51 ± 0.26 vs. 28.12 ± 0.63; about 6–10% fewer env steps per second. G1 has not been run.
 
 ## Logs
 
@@ -83,10 +150,14 @@ Each run writes `logs/<group_name>/<exp_name>/<env_name>/seed<seed>_<time>/`:
 | `replay/batch_td_abs`, `replay/batch_surprise` | Unweighted error of the critic's batch |
 | `replay/age_surprise_corr` | Pearson correlation between age and surprise in the critic's batch |
 | `replay/size` | Transitions in the buffer |
+| `critic_target/gap` | Mean \|Q_target − Q_online\| at (s', a') over both critics: how stale the target network is. Not logged for `online` |
+| `critic_target/online_frac` | Fraction of the batch whose TD target came from an online critic (`minto`, `minto_net`) |
 | `actor_delay/delay`, `td_ratio`, `td_ema` | Current delay, `e / ema`, and the EMA |
 | `actor_delay/actor_updated` | Fraction of critic updates that also updated the actor |
 | `laber/candidate_*` | Surprise, TD error, age and their correlation over the uniform candidates |
 | `laber/effective_sample_frac`, `weight_max`, `unique_frac` | How concentrated the LaBER selection is |
+| `critic/surprise_weight_min`, `_max`, `_ess` | Range of the surprise weights and their effective sample fraction (1 = uniform) |
+| `critic/surprise_weight_age_corr` | Pearson correlation between sample age and surprise weight |
 
 ## Videos
 
@@ -107,6 +178,6 @@ the Isaac Sim viewport as before.
 
 ## Tests
 
-    python -m pytest tests/test_extensions.py
-
-CPU-only; covers the SWD sampling distribution, ages, the delay rules, LaBER weights, the LR schedule and the CSV log.
+The test command is in `STEPS.md` (step 2). `tests/test_extensions.py` is CPU-only; it covers the SWD sampling
+distribution, ages, the delay rules, LaBER weights, the LR schedule, the critic target options and the CSV log. The tests disable `torch.compile`, so run a short GPU job per `critic_target` option
+before a sweep.
