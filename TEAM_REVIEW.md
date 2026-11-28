@@ -121,6 +121,9 @@
 - So extra width should add usable capacity rather than instability.
 - **Speed:** update time −8.4% (1 critic) and −9.8% (1 wide critic) vs the baseline, so the wider network gives back almost none of the savings.
 
+**Note on WarpSAC**
+- WarpSAC only ablates critic depth, not critic width
+- We fill this gap
 
 ### References
 

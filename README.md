@@ -1,55 +1,48 @@
-<h1><img src="docs/images/icon/flashsac_logo.svg" alt="FlasahSAC" height="60"></h1>
+# Extending FlashSAC for Humanoid Locomotion
 
-Official implementation of 
+Course project for CMU 16-831 (Introduction to Robot Learning), Fall 2026.
+Authors: Henri Sayag, Jaehoon Choi, Nishchay Jasuja, Rafay Mahmood, Shiyu Chen
 
-**FlashSAC: Fast and Stable Off-Policy Reinforcement Learning for High-Dimensional Robot Control**
+We reproduce FlashSAC on four IsaacLab humanoid locomotion tasks, then test changes to its critic aimed at lower wall-clock time and higher return.
 
-[![Project Page](https://img.shields.io/badge/Project_Page-Visit-blue.svg)](https://holiday-robot.github.io/FlashSAC/)
-[![PDF](https://img.shields.io/badge/PDF-arXiv-b31b1b.svg)](https://arxiv.org/abs/2604.04539)
+## Credit: FlashSAC
 
-> [Donghu Kim](https://i-am-proto.github.io/)\*<sup>1</sup>, [Youngdo Lee](https://leeyngdo.github.io/)\*<sup>2,3</sup>, [Minho Park](https://pmh9960.github.io/)<sup>2</sup>, [Kinam Kim](https://kinam0252.github.io/)<sup>2</sup>, [Takuma Seno](https://takuseno.github.io/)<sup>4</sup>, [I Made Aswin Nahrendra](https://anahrendra.github.io/)<sup>3</sup>, [Sehee Min](https://seiing.github.io/)<sup>1</sup>, [Daniel Palenicek](https://www.linkedin.com/in/danielpalenicek/)<sup>5,6</sup>, [Florian Vogt](https://scholar.google.com/citations?user=PvEf33EAAAAJ)<sup>7</sup>, [Danica Kragic](https://www.csc.kth.se/~dani/)<sup>7</sup>, [Jan Peters](https://www.ias.informatik.tu-darmstadt.de/Member/JanPeters)<sup>5,6,8</sup>, [Jaegul Choo](https://sites.google.com/site/jaegulchoo/)<sup>2</sup>, [Hojoon Lee](https://joonleesky.github.io/)<sup>1</sup>
->
-> <sup>1</sup>Holiday Robotics, <sup>2</sup>KAIST, <sup>3</sup>KRAFTON, <sup>4</sup>Turing Inc, <sup>5</sup>TU Darmstadt, <sup>6</sup>hessian.AI, <sup>7</sup>KTH Royal Institute of Technology, <sup>8</sup>German Research Center for AI (DFKI)
->
-> (\* indicates equal contribution)
->
-> arXiv'2026.
+This project builds on **FlashSAC** and its code. The paper is the one our project studies, and this repository builds off their official implementation.
 
-## 🎬 Teaser Video
+- **Paper:** *FlashSAC: Fast and Stable Off-Policy Reinforcement Learning for High-Dimensional Robot Control.* Kim, Lee, et al., arXiv 2026. [arXiv:2604.04539](https://arxiv.org/abs/2604.04539)
+- **Code:** [github.com/Holiday-Robot/FlashSAC](https://github.com/Holiday-Robot/FlashSAC)
+- **Project page:** [holiday-robot.github.io/FlashSAC](https://holiday-robot.github.io/FlashSAC/)
 
-https://github.com/user-attachments/assets/0c0a650b-dd59-4cf4-8378-605006a00c63
-
-## About FlashSAC
-
-**FlashSAC** is a fast and stable off-policy reinforcement learning algorithm that achieves the highest asymptotic performance in the shortest wall-clock time for high-dimensional robotic control.
-
-This repository (**FlashSAC**) provides the full training framework, agent implementations, and environment integrations used in the paper, supporting **over 100 tasks across diverse simulators**: IsaacLab, MuJoCo Playground, ManiSkill, Genesis, HumanoidBench, MyoSuite, MuJoCo, Meta-World, and DeepMind Control Suite.
-
-If you're using PPO, try **FlashSAC**!
+The training framework, agent, environment wrappers and default configs belong to the FlashSAC authors. Our additions are listed below and in [EXTENSIONS.md](EXTENSIONS.md). Please cite the original paper (see [Citation](#citation)) if you use this code.
 
 ## Installation
 
-### 1. Install uv
+Tested on Ubuntu 22.04/24.04 with an NVIDIA L40S (AWS g6e). For a fresh AWS GPU instance, `bash scripts/aws_bootstrap.sh && source ~/.bashrc` runs steps 1–3 (it pins Python 3.11.14 from `.python-version` and installs the IsaacLab extra).
 
-```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
-export PATH="$HOME/.local/bin:$PATH"
-```
+1. Install [uv](https://docs.astral.sh/uv/):
 
-### 2. Pin Python Version
+   ```bash
+   curl -LsSf https://astral.sh/uv/install.sh | sh
+   export PATH="$HOME/.local/bin:$PATH"
+   ```
 
-| Configuration | Ubuntu | GPU | Python |
-|---|---|---|---|
-| Config 1 | 22.04 | RTX 30x0, 40x0 | `uv python pin 3.10.18` |
-| Config 2 | 24.04 | RTX 50x0, Bx00 (Blackwell) | `uv python pin 3.11.14` |
+2. Pin the Python version:
 
-### 3. Install Dependencies
+   | Ubuntu | GPU | Command |
+   |---|---|---|
+   | 22.04 | RTX 30x0, 40x0 | `uv python pin 3.10.18` |
+   | 24.04 | RTX 50x0, Bx00 (Blackwell), L40S | `uv python pin 3.11.14` |
 
-```bash
-uv sync
-```
+3. Install dependencies. The IsaacLab extra is needed for our experiments, and it must live in its own environment, because it conflicts with `genesis` and `humanoid-bench`:
 
-### 4. Install MuJoCo
+   ```bash
+   uv sync --extra isaaclab
+   ```
+
+   Other extras: `mujoco-playground`, `maniskill`, `genesis`, `humanoid-bench`, `myosuite`, `metaworld`, `all` (everything except `isaaclab`).
+
+<details>
+<summary>MuJoCo / DMC setup (only needed for the non-IsaacLab tasks)</summary>
 
 ```bash
 wget https://github.com/deepmind/mujoco/releases/download/2.1.0/mujoco210-linux-x86_64.tar.gz
@@ -70,106 +63,58 @@ export MUJOCO_EGL_DEVICE_ID="0"
 export MKL_SERVICE_FORCE_INTEL="0"
 ```
 
-Verify:
+Verify with `uv run python -c "import gymnasium; gymnasium.make('HalfCheetah-v4')"`.
+
+`mujoco-playground` has known issues with JAX > 0.5.2 ([issue #153](https://github.com/google-deepmind/mujoco_playground/issues/153)) and may not work with Python 3.11.
+
+</details>
+
+## Running experiments
+
+### Our humanoid runs
+
+`scripts/run_humanoid.sh <exp_name> [--asym] [overrides...]` trains the four humanoid tasks with the project defaults. `scripts/run_variant.sh` wraps it with retries and per-run timeouts for long sweeps:
 
 ```bash
-source ~/.bashrc
-uv run python -c "import gymnasium; gymnasium.make('HalfCheetah-v4')"
+bash scripts/run_humanoid.sh baseline
+bash scripts/run_humanoid.sh crossq          agent.critic_target=online
+bash scripts/run_humanoid.sh crossq_1q       agent.critic_target=online agent.critic_num_qs=1
+bash scripts/run_humanoid.sh crossq_1q_w360  agent.critic_target=online agent.critic_num_qs=1 agent.critic_hidden_dim=360
+bash scripts/run_humanoid.sh crossq_1q_asym  --asym agent.critic_target=online agent.critic_num_qs=1
+
+# sweep with retries: pick seeds and tasks with env vars
+EXP=baseline_1q SEEDS="0 1000 2000" bash scripts/run_variant.sh agent.critic_num_qs=1
 ```
 
-### 5. Optional Environment Dependencies
+The header of each script lists its options. Asymmetric runs on the rough tasks need a larger replay buffer than fits on a 48 GB GPU; see [RUNS.md](RUNS.md) for the CPU-buffer workaround and its time cost.
 
-By default, only MuJoCo and DMC are available. Install additional environments with:
-
-```bash
-uv sync --extra <environment>
-```
-
-Available extras: `isaaclab`, `mujoco-playground`, `maniskill`, `genesis`, `humanoid-bench`, `myosuite`, `metaworld`, `all`
-
-> [!NOTE]
-> `mujoco-playground` has known issues with JAX > 0.5.2 (NaN values, training collapse — see [issue #153](https://github.com/google-deepmind/mujoco_playground/issues/153)) and may not work with Python 3.11.
-
-> [!NOTE]
-> `isaaclab` cannot be installed alongside `genesis` or `humanoid-bench` due to dependency conflicts. If you need IsaacLab, install it in a separate virtual environment with `uv sync --extra isaaclab`. For the same reason, `all` installs every extra **except** `isaaclab`.
-
-## Training
-
-### Single Experiment
+### General training
 
 ```bash
 uv run python train.py
-```
-
-Override config values via `--overrides`:
-
-```bash
 uv run python train.py --overrides env=dmc --overrides env.env_name='humanoid-walk'
 ```
 
-### Batch Experiments
-
-Example scripts for each environment are provided in `scripts/`:
-
-```bash
-bash scripts/run_mujoco.sh
-bash scripts/run_isaaclab.sh
-```
-
-### Configuration
-
-Configs are managed via [Hydra](https://hydra.cc/). The base config is `configs/flashSAC_base.yaml`, with modular sub-configs under `configs/agent/` and `configs/env/`.
+Configs use [Hydra](https://hydra.cc/). The base config is `configs/flashSAC_base.yaml`, with sub-configs in `configs/agent/` and `configs/env/`. Upstream example scripts for each simulator are in `scripts/run_<simulator>.sh`.
 
 ### Logging
 
-Both **Weights & Biases** and **TensorBoard** are supported. Set `logger_type` in `configs/flashSAC_base.yaml`:
+Set `logger_type` in `configs/flashSAC_base.yaml` to `'wandb'` or `'tensorboard'`. TensorBoard logs go to `runs/` (`tensorboard --logdir runs`). Each run also writes a `metrics.csv` (turn off with `log_csv=false`), which the plotting script reads.
 
-```yaml
-logger_type: 'wandb'        # or 'tensorboard'
-```
+## Results and plots
 
-TensorBoard logs are saved to `runs/`. Launch with:
+Pulled runs live in `results/<member>/<method>/<task>/<run>/` (for example `results/nish/crossq_1q/Isaac-Velocity-Rough-H1-v0/...`). Superseded runs are kept under `results/<member>/old_runs/`.
 
 ```bash
-tensorboard --logdir runs
+python scripts/plot_results.py --results_dir results/nish --out_dir results/nish/plots \
+    --methods baseline crossq crossq_1q crossq_1q_w360 baseline_1q
 ```
 
-## Performance Optimizations
-
-FlashSAC adapts its configuration based on the simulator type for optimal speed:
-
-| | GPU simulators (IsaacLab, MJP, Genesis, ManiSkill) | CPU simulators (MuJoCo, DMC, HBench, Myosuite) |
-|---|---|---|
-| `num_envs` | 1024 | 1 |
-| `batch_size` | 2048 | 512 |
-| AMP | On | Off |
-| Buffer device | `cuda:0` | `cpu` |
-
- > [!NOTE]
-> **`torch.compile` mode is determined by Python version.** This is configured automatically — do not change it manually.
-
-| Python | Compile mode | PyTorch | Notes |
-|---|---|---|---|
-| 3.10 | `reduce-overhead` | 2.5.1 | Legacy default |
-| 3.11 | `max-autotune` | 2.9.1 | `reduce-overhead` causes 5–10x slowdowns after PyTorch 2.8 |
-
-> We use PyTorch 2.9.1 for Python 3.11 instead of 2.7.1 (IsaacLab's default), since IsaacLab will eventually migrate to newer versions. See `pyproject.toml` for version pinning details.
-
-**Key design choices:**
-
-- **AMP off for small batches** — AMP incurs a GPU/CPU sync that becomes a bottleneck when batch and model sizes are small.
-- **CPU buffer for CPU simulators** — With only 1 env, the overhead of GPU buffer operations outweighs the benefit. GPU buffer only pays off with large parallel envs.
-- **Compiled critical paths** — Weight normalization, target critic EMA, `_select_min_q_log_probs`, and `_compute_categorical_td_target` are compiled for speed.
-
-See the `scripts/` directory for recommended per-environment configurations.
+This writes return vs. steps, return vs. wall-clock time, normalized AUC, update-time and time-breakdown plots, and critic TD-error diagnostics. The docstring at the top of [scripts/plot_results.py](scripts/plot_results.py) explains each figure. `scripts/compare_baseline.py` compares our baseline with the paper's curves (`results/nish/plots/paper_vs_baseline.png`).
 
 ## Checkpointing
 
-Agent checkpoints and replay buffers can be saved and loaded during training.
-
-### Saving
-
-Checkpoints are saved automatically at the end of training by default. To save at regular intervals, set `save_checkpoint_per_interaction_step` and optionally `save_buffer_per_interaction_step`:
+Checkpoints are saved at the end of training to `models/<group>/<exp>/<env_name>/seed<seed>-<timestamp>/step<N>/`. They contain the actor, critic, target critic, temperature, reward normalizer and agent state. To save at intervals:
 
 ```bash
 uv run python train.py \
@@ -177,23 +122,11 @@ uv run python train.py \
     --overrides save_buffer_per_interaction_step=24400
 ```
 
-Checkpoints are saved to `models/<group>/<exp>/<env_name>/seed<seed>-<timestamp>/step<N>/` and include the actor, critic, target critic, temperature, reward normalizer, and agent state (update step, grad scaler).
-
-### Loading
-
-To resume training from a checkpoint, provide `agent_load_path` and optionally `buffer_load_path`:
-
-```bash
-uv run python train.py \
-    --overrides agent_load_path='models/.../step24400' \
-    --overrides buffer_load_path='models/.../step24400'
-```
-
-By default, optimizer and reward normalizer states are also restored. This can be configured via `agent.load_optimizer` and `agent.load_reward_normalizer` in the agent config.
+To resume, pass `agent_load_path` and optionally `buffer_load_path` (both point to a `step<N>` directory). Optimizer and reward-normalizer states are restored by default (`agent.load_optimizer`, `agent.load_reward_normalizer`).
 
 ## Visualization (IsaacLab)
 
-Trained IsaacLab agents can be visualized in the Isaac Sim viewport using `play_isaaclab.py`. This uses the same Hydra config system as training — pass the same `--overrides` you trained with so the network architecture matches the checkpoint.
+Trained IsaacLab agents can be visualized in the Isaac Sim viewport using `play_isaaclab.py`. It uses the same Hydra config system as training, so pass the same `--overrides` you trained with to make the network architecture match the checkpoint.
 
 ```bash
 uv run python play_isaaclab.py \
@@ -206,8 +139,6 @@ uv run python play_isaaclab.py \
     --overrides agent.asymmetric_observation=true \
     --overrides agent.buffer_max_length=1
 ```
-
-Key arguments:
 
 | Argument | Description |
 |---|---|
@@ -225,14 +156,18 @@ Key arguments:
 flash_rl/
   agents/       # Agent implementations (FlashSAC, random)
   buffers/      # Replay buffer implementations
-  common/       # Logger (wandb / tensorboard)
+  common/       # Logger (wandb / tensorboard / csv)
   envs/         # Environment wrappers (Gymnasium 1.1 API)
   evaluation.py # Evaluation and video recording
 configs/           # Hydra configs (base, agent, env)
-scripts/           # Launch scripts per environment
+scripts/           # Launch, AWS setup and plotting scripts
 results/           # Experiment results and plots
+models/            # Saved checkpoints
+docs/              # Upstream FlashSAC project page
 train.py           # Training entry point
 play_isaaclab.py   # IsaacLab visualization entry point
+EXTENSIONS.md      # Config keys and methods we added
+RUNS.md            # Run matrix and status
 ```
 
 ## Development
@@ -244,6 +179,8 @@ uv sync --dev    # install formatters, linter, type checker
 
 ## Citation
 
+This project is based on FlashSAC. Please cite the original paper:
+
 ```bibtex
 @article{kim2026flashsac,
   title={FlashSAC: Fast and Stable Off-Policy Reinforcement Learning for High-Dimensional Robot Control},
@@ -252,3 +189,7 @@ uv sync --dev    # install formatters, linter, type checker
   year={2026}
 }
 ```
+
+## License
+
+See [LICENSE](LICENSE) (inherited from FlashSAC).
